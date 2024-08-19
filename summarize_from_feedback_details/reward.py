@@ -354,11 +354,14 @@ if __name__ == "__main__":
     np.random.seed(local_seed)
     torch.manual_seed(local_seed)
     torch.backends.cudnn.deterministic = True
-    model_config = AutoConfig.from_pretrained(args.sft_model_path)
+
+    model_config = AutoConfig.from_pretrained('vwxyzjn/EleutherAI_pythia-1b-deduped__sft__tldr')
     scalar_model_config = ScalarModelConfig(
-        base_model=args.sft_model_path,
+        'vwxyzjn/EleutherAI_pythia-1b-deduped__sft__tldr',
         base_config=model_config,
         hidden_size=model_config.hidden_size,
+        revision='sft__44413__1708611267',
+        trust_remote_code=True,
     )
     if len(args.reward_model_path) == 0:
         model: PreTrainedModel = ScalarModel(scalar_model_config)

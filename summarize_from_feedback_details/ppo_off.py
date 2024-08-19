@@ -59,8 +59,7 @@ class Args:
     # optimizer args
     eps: float = 1e-5
     """the epsilon value for the optimizer"""
-    lr: float = 3e-6
-    save_steps: int = 200
+    lr: float = 1e-6
     """the learning rate"""
     optimizer: Literal["adam", "adamw"] = "adamw"
     """Which optimizer to use"""
@@ -68,6 +67,9 @@ class Args:
     """Which scheduler to use"""
     warm_up_steps: int = 150
     """Number of warm up steps for the scheduler"""
+    loss_name: str = 'IS'
+    clipping_ratio: float = 0.2
+    tau: float = 2.0
 
     # various batch sizes
     world_size: Optional[int] = None
@@ -108,11 +110,8 @@ class Args:
     """the sampling temperature"""
     label_dataset: str = "vwxyzjn/summarize_from_feedback_oai_preprocessing_1706381144"
     """the name of the dataset to use for labels in `https://huggingface.co/datasets/vwxyzjn/lm-human-preferences`"""
-    ipo: bool = False
-    """Whether to use IPO loss https://arxiv.org/abs/2310.12036"""
-    label_smoothing: float = 0.0
-    """Label smoothing for DPO (Eq. 3 https://ericmitchell.ai/cdpo.pdf; label_smoothing=0 gives original DPO (Eq. 7 of https://arxiv.org/pdf/2305.18290.pdf))"""
-    beta: float = 0.1
+    save_steps: int = 200
+    beta: float = 0.05
     """The beta value for DPO"""
 
     # wandb and HF tracking configs
@@ -122,7 +121,7 @@ class Args:
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
-    push_to_hub: bool = False
+    push_to_hub: bool = True
     """whether to upload the saved model to huggingface"""
     hf_entity: Optional[str] = None
     """the user or org name of the model repository from the Hugging Face Hub"""
@@ -132,7 +131,7 @@ class Args:
     """the revision of the saved model in the Hugging Face Hub (can be autoset if not given)"""
     hf_repo_url: Optional[str] = None
     """the url of the saved model in the Hugging Face Hub (will be autoset)"""
-    output_dir: str = "models/dpo_model"
+    output_dir: str = "models/ppo_off_model"
     """Where to save the model"""
 
 
@@ -166,6 +165,51 @@ def disable_dropout(model: torch.nn.Module):
         if isinstance(module, torch.nn.Dropout):
             module.p = 0
 
+def pairwise_loss(
+    chosen_logps: torch.FloatTensor,
+    rejected_logps: torch.FloatTensor,
+    ref_chosen_logps: torch.FloatTensor,
+    ref_rejected_logps: torch.FloatTensor,
+    chosen_mask: torch.FloatTensor,
+    rejected_mask: torch.FloatTensor,
+    beta: float,
+    loss_name: str = 'IS',
+    clipping_ratio: float = None,
+    tau: float = None
+):
+    with torch.no_grad():
+        pi_logratios = chosen_logps - rejected_logps
+        ref_logratios = ref_chosen_logps - ref_rejected_logps
+        logits = pi_logratios - ref_logratios
+        advantages = (-beta * F.sigmoid(-beta * logits)).detach()
+        if loss_name == 'IS':
+            chosen_ratio = torch.exp(chosen_logps- ref_chosen_logps).detach()
+            rejected_ratio = torch.exp(rejected_logps - ref_rejected_logps).detach()
+            ratio = chosen_ratio * rejected_ratio
+        
+        elif loss_name == 'length_IS':
+            chosen_ratio = torch.exp((chosen_logps- ref_chosen_logps) / chosen_mask).detach()
+            rejected_ratio = torch.exp((rejected_logps - ref_rejected_logps) / rejected_mask).detach()
+            ratio = chosen_ratio * rejected_ratio
+
+        elif loss_name == 'clipped':
+            assert clipping_ratio is not None
+            chosen_ratio = torch.exp(chosen_logps- ref_chosen_logps).detach()
+            rejected_ratio = torch.exp(rejected_logps - ref_rejected_logps).detach()
+            ratio = (chosen_ratio * rejected_ratio).clamp(min=1-clipping_ratio, max=1+clipping_ratio)
+
+        elif loss_name == 'sigmoid':
+            assert tau is not None and tau != 0
+            chosen_ratio = torch.exp(chosen_logps- ref_chosen_logps).detach()
+            rejected_ratio = torch.exp(rejected_logps - ref_rejected_logps).detach()
+            probs_ratio = F.sigmoid(tau * (chosen_ratio * rejected_ratio) - 1) 
+            ratio = probs_ratio * (1-probs_ratio) * 4 * chosen_ratio * rejected_ratio
+        
+        else:
+            raise ValueError(f'unknown loss {loss_name}')
+
+    losses = advantages * ratio * (chosen_logps - rejected_logps)
+    return losses, chosen_ratio, rejected_ratio
 
 def forward(model, query_responses, labels, tokenizer):
     attention_mask = query_responses != tokenizer.pad_token_id
@@ -180,9 +224,14 @@ def forward(model, query_responses, labels, tokenizer):
     loss_mask = (labels != tokenizer.pad_token_id)
     per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
     all_logps = (per_token_logps * loss_mask).sum(-1)
+    all_loss_mask = loss_mask.sum(-1)
+
     chosen_logps = all_logps[:query_responses.shape[0] // 2]
     rejected_logps = all_logps[query_responses.shape[0] // 2:]
-    return chosen_logps, rejected_logps
+
+    chosen_loss_mask = all_loss_mask[:query_responses.shape[0] // 2]
+    rejected_loss_mask = all_loss_mask[query_responses.shape[0] // 2:]
+    return chosen_logps, rejected_logps, chosen_loss_mask, rejected_loss_mask
 
 
 def generate(lm_backbone, queries, tokenizer, generation_config):
@@ -227,8 +276,8 @@ def evaluate_rm(args: Args, accelerator, tokenizer, model, ref_model, dataloader
         for data in tqdm(dataloader):
             query_responses = torch.cat((data["query_chosen_token"], data["query_rejected_token"]), dim=0)
             labels = torch.cat((data["query_chosen_token_response_label"], data["query_rejected_token_response_label"]), dim=0)
-            ref_chosen_logps, ref_rejected_logps = forward(ref_model, query_responses, labels, tokenizer)
-            chosen_logps, rejected_logps = forward(model, query_responses, labels, tokenizer)
+            ref_chosen_logps, ref_rejected_logps, _, _ = forward(ref_model, query_responses, labels, tokenizer)
+            chosen_logps, rejected_logps, _, _ = forward(model, query_responses, labels, tokenizer)
             reward_preferred = args.beta * (chosen_logps - ref_chosen_logps)
             reward_rejected = args.beta * (rejected_logps - ref_rejected_logps)
             accuracy = reward_preferred > reward_rejected
@@ -241,13 +290,18 @@ def evaluate_rm(args: Args, accelerator, tokenizer, model, ref_model, dataloader
                 items["query"].append(tokenizer.decode(data["query_token"][i], skip_special_tokens=True))
                 items["chosen"].append(tokenizer.decode(data["chosen_token"][i]))
                 items["rejected"].append(tokenizer.decode(data["rejected_token"][i]))
+                items["batch"].append(data["batch"][i])
+                items["split"].append(data["split"][i])
+                items["confidence"].append(data["extra.confidence"][i].item())
                 items["choice"].append(data["choice"][i].item())
+                items["policies"].append(data["policies"][i])
+                items["chosen_policy"].append(data["chosen_policy"][i])
+                items["rejected_policy"].append(data["rejected_policy"][i])
                 items["accuracy"].append(accuracy[i].item())
                 items["reward_preferred"].append(reward_preferred[i].item())
                 items["reward_rejected"].append(reward_rejected[i].item())
     model.train()
     return pd.DataFrame(items)
-
 
 
 @dataclass
@@ -308,18 +362,7 @@ if __name__ == "__main__":
     local_seed = args.seed + accelerator.process_index * 100003  # Prime
 
     # load dataset
-    # from datasets import load_from_disk
     dataset = load_dataset('DatPySci/summarize_from_feedback_oai_preprocessing_pythia-6.9b-gold', split='train')
-    # dataset= load_from_disk("data/tldr_pref")
-    # def relabel(example):
-    #     if example['chosen_score'] < example['rejected_score']:
-    #         example['chosen_token'], example['rejected_token'] = example['rejected_token'], example['chosen_token']
-    #         example['query_chosen_token'], example['query_rejected_token'] = example['query_rejected_token'], example['query_chosen_token']
-    #         example['query_chosen_token_response_label'], example['query_rejected_token_response_label'] = example['query_rejected_token_response_label'], example['query_chosen_token_response_label']
-    #         example["chosen_policy"], example["rejected_policy"] = example['rejected_policy'], example['chosen_policy']
-    #     return example
-    
-    # dataset = dataset.map(relabel, num_proc=8, batched=False)
     dataset = dataset.shuffle(seed=local_seed)
     dataset = dataset.select(range(args.total_episodes))
     dataset = dataset.with_format(
@@ -361,6 +404,7 @@ if __name__ == "__main__":
         )
         eval_datasets.append(validation_dataset)
         eval_dataloaders[split] = DataLoader(validation_dataset, batch_size=args.local_eval_batch_size)
+    
     sft_validation_dataset = load_dataset(args.query_dataset, split="validation")
     sft_validation_dataset = sft_validation_dataset.with_format("torch", columns=["query_token", "reference_response_token", "query_reference_response_token_response_label"])
     sft_validation_dataloader = DataLoader(sft_validation_dataset, batch_size=args.local_eval_batch_size)
@@ -404,7 +448,6 @@ if __name__ == "__main__":
     np.random.seed(local_seed)
     torch.manual_seed(local_seed)
     torch.backends.cudnn.deterministic = True
-
     model_config = AutoConfig.from_pretrained('vwxyzjn/EleutherAI_pythia-1b-deduped__sft__tldr')
     model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
         'vwxyzjn/EleutherAI_pythia-1b-deduped__sft__tldr',
@@ -412,7 +455,6 @@ if __name__ == "__main__":
         revision='sft__44413__1708611267',
         trust_remote_code=True,
     )
-
     ref_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
         'vwxyzjn/EleutherAI_pythia-1b-deduped__sft__tldr',
         config=model_config,
@@ -422,6 +464,7 @@ if __name__ == "__main__":
     
     disable_dropout(model)
     disable_dropout(ref_model)
+    
     model.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     if args.optimizer == "adam":
@@ -478,27 +521,32 @@ if __name__ == "__main__":
                         state_dict=accelerator.get_state_dict(model),
                         safe_serialization=False,
                     )
-            
+                
             update += 1
             global_step += args.micro_batch_size
             query_responses = torch.cat((data["query_chosen_token"], data["query_rejected_token"]), dim=0)
             labels = torch.cat((data["query_chosen_token_response_label"], data["query_rejected_token_response_label"]), dim=0)
             with torch.no_grad():
-                ref_chosen_logps, ref_rejected_logps = forward(ref_model, query_responses, labels, tokenizer)
+                ref_chosen_logps, ref_rejected_logps, ref_chosen_mask, ref_rejected_mask = forward(ref_model, query_responses, labels, tokenizer)
             with accelerator.accumulate(model):
-                chosen_logps, rejected_logps = forward(model, query_responses, labels, tokenizer)
-                pi_logratios = chosen_logps - rejected_logps
-                ref_logratios = ref_chosen_logps - ref_rejected_logps
-                logits = pi_logratios - ref_logratios  # also known as h_{\pi_\theta}^{y_w,y_l}
-                if args.ipo:
-                    batch_loss = (logits - 1/(2 * args.beta)) ** 2  # Eq. 17 of https://arxiv.org/pdf/2310.12036v2.pdf
-                else:
-                    batch_loss = -F.logsigmoid(args.beta * logits) * (1 - args.label_smoothing) - F.logsigmoid(-args.beta * logits) * args.label_smoothing
-                
-                loss = batch_loss.mean()
+                chosen_logps, rejected_logps, chosen_mask, rejected_mask = forward(model, query_responses, labels, tokenizer)
+                mb_losses, chosen_ratio, rejected_ratio = pairwise_loss(
+                    chosen_logps=chosen_logps,
+                    rejected_logps=rejected_logps,
+                    ref_chosen_logps=ref_chosen_logps,
+                    ref_rejected_logps=ref_rejected_logps,
+                    rejected_mask=rejected_mask,
+                    chosen_mask=chosen_mask,
+                    loss_name=args.loss_name,
+                    beta=args.beta,
+                    clipping_ratio=args.clipping_ratio,
+                    tau=args.tau
+                )
+                loss = mb_losses.mean()
                 accelerator.backward(loss)
                 optimizer.step()
                 optimizer.zero_grad()
+            
             with torch.no_grad():
                 reward_preferred = args.beta * (chosen_logps - ref_chosen_logps)
                 reward_rejected = args.beta * (rejected_logps - ref_rejected_logps)
@@ -508,12 +556,15 @@ if __name__ == "__main__":
                 reward_rejecteds[gradient_accumulation_idx] = reward_rejected.mean()
                 reward_margins[gradient_accumulation_idx] = (reward_preferred - reward_rejected).mean()
             gradient_accumulation_idx = (gradient_accumulation_idx + 1) % args.gradient_accumulation_steps
+
             if update > 1 and (update - 1) % args.gradient_accumulation_steps == 0:
                 scheduler.step()
                 train_accuracy = accelerator.gather(accuracies).mean().item()
                 writer.add_scalar("train/rm/loss", accelerator.gather(losses).mean().item(), global_step)
                 writer.add_scalar("train/rm/forward_KL", accelerator.gather((ref_chosen_logps - chosen_logps + ref_rejected_logps - rejected_logps)/2).mean().item(), global_step)
                 writer.add_scalar("train/rm/accuracy", train_accuracy, global_step)
+                writer.add_scalar("train/rm/chosen_ratio", accelerator.gather(chosen_ratio).clamp(min=1-args.clipping_ratio, max=1+args.clipping_ratio).mean().item(), global_step)
+                writer.add_scalar("train/rm/rejected_ratio", accelerator.gather(rejected_ratio).clamp(min=1-args.clipping_ratio, max=1+args.clipping_ratio).mean().item(), global_step)
                 writer.add_scalar("train/rm/chosen_logps", accelerator.gather(chosen_logps).mean().item(), global_step)
                 writer.add_scalar("train/rm/rejected_logps", accelerator.gather(rejected_logps).mean().item(), global_step)
                 writer.add_scalar(
@@ -525,7 +576,7 @@ if __name__ == "__main__":
                 accelerator.print(
                     f"{train_accuracy=}, {scheduler.get_last_lr()=}, {optimizer.param_groups[0]['lr']=}, {update=}"
                 )
-
+    
     # if args.run_eval:
     #     _, evaluate_df = evaluate_policy(args, model, tokenizer, sft_validation_dataloader, validation_generation_config, sampling=False)
     #     if accelerator.is_main_process:
@@ -556,27 +607,27 @@ if __name__ == "__main__":
     #         torch.cuda.empty_cache()
 
     # save model
-    # if args.output_dir and args.num_train_epochs > 0:
-    os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
-    time_tensor = torch.tensor([int(time.time())], device=device)
-    time_int = accelerator.gather(time_tensor)[0].item()  # avoid different timestamps across processes
-    repo_name = f"{args.base_model.replace('/', '_')}__{args.exp_name}__tldr"
-    repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
+    if args.output_dir and args.num_train_epochs > 0:
+        os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
+        time_tensor = torch.tensor([int(time.time())], device=device)
+        time_int = accelerator.gather(time_tensor)[0].item()  # avoid different timestamps across processes
+        repo_name = f"{args.base_model.replace('/', '_')}__{args.exp_name}__tldr"
+        repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
 
-    if accelerator.is_main_process:
-        tokenizer.save_pretrained(args.output_dir)
-        if args.push_to_hub:
-            tokenizer.push_to_hub(repo_id=args.hf_repo_id, revision=args.hf_repo_revision)
-    unwrapped: PreTrainedModel = accelerator.unwrap_model(model)
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        unwrapped.save_pretrained(
-            args.output_dir,
-            is_main_process=accelerator.is_main_process,
-            save_function=accelerator.save,
-            state_dict=accelerator.get_state_dict(model),
-            safe_serialization=False,
-        )
-        if args.push_to_hub:
-            unwrapped.push_to_hub(repo_id=args.hf_repo_id, revision=args.hf_repo_revision, safe_serialization=False)
-            accelerator.print(f"🔥 pushed to {args.hf_repo_url}")
+        if accelerator.is_main_process:
+            tokenizer.save_pretrained(args.output_dir)
+            if args.push_to_hub:
+                tokenizer.push_to_hub(repo_id=args.hf_repo_id, revision=args.hf_repo_revision)
+        unwrapped: PreTrainedModel = accelerator.unwrap_model(model)
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            unwrapped.save_pretrained(
+                args.output_dir,
+                is_main_process=accelerator.is_main_process,
+                save_function=accelerator.save,
+                state_dict=accelerator.get_state_dict(model),
+                safe_serialization=False,
+            )
+            if args.push_to_hub:
+                unwrapped.push_to_hub(repo_id=args.hf_repo_id, revision=args.hf_repo_revision, safe_serialization=False)
+                accelerator.print(f"🔥 pushed to {args.hf_repo_url}")
