@@ -1,7 +1,7 @@
 from collections import defaultdict
 from dataclasses import dataclass
 import os
-
+import argparse
 import numpy as np
 import pandas as pd
 import torch
@@ -9,6 +9,8 @@ import torch.nn as nn
 from datasets import load_dataset
 from rich.console import Console
 from rich.table import Table
+from tqdm.contrib import tzip
+from tqdm import tqdm
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -18,6 +20,7 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
 )
+torch.autograd.grad_mode.set_grad_enabled(False)
 
 @dataclass
 class RunRecord:
@@ -25,55 +28,6 @@ class RunRecord:
     hf_repo_url: str
     hf_repo_id: str
     revision: str
-
-console = Console()
-
-if not os.path.exists("release_runs.csv"):
-    import wandb
-    keys = {
-        "sft": "refactor-chosen-rejected3",
-        "reward": "refactor-chosen-rejected3",
-        "ppo_left_padding_new_nowhiten_reward": "refactor-chosen-rejected3",
-        "dpo": "refactor-chosen-rejected2",
-    }
-    runs = []
-    for exp_name, tag in keys.items():
-        runs.extend(list(wandb.Api().runs(
-            path=f"costa-huang/tldr_summarize",
-            filters={
-                "$and": [
-                    {f"config.exp_name.value": exp_name},
-                    {"tags": {"$in": [tag]}},
-                ]
-            }
-        )))
-    table = defaultdict(list)
-    for i in range(len(runs)):
-        table["base_model"].append(runs[i].config["base_model"])
-        table["exp"].append(runs[i].config["exp_name"])
-        table["seed"].append(runs[i].config["seed"])
-        table["wandb_url"].append(runs[i].url)
-        table["hf_repo_url"].append(runs[i].config["hf_repo_url"])
-        table["hf_repo_id"].append(runs[i].config["hf_repo_id"])
-        table["revision"].append(runs[i].config["run_name"])
-    df = pd.DataFrame(table)
-    df.to_csv("release_runs.csv", index=False)
-else:
-    df = pd.read_csv("release_runs.csv")
-
-
-df = df.groupby(["base_model", "exp", "seed"]).agg(lambda x: x.tolist()[0])
-
-# feel free to change the base_model, exp, and seed; the seeds are 44413, 55513, 66613, 77713
-sft_record = RunRecord(**df.loc[("EleutherAI/pythia-1b-deduped", "sft", 55513)])
-ppo_record = RunRecord(**df.loc[("EleutherAI/pythia-1b-deduped", "ppo_left_padding_new_nowhiten_reward", 55513)])
-dpo_record = RunRecord(**df.loc[("EleutherAI/pythia-1b-deduped", "dpo", 55513)])
-rm_record = RunRecord(**df.loc[("EleutherAI/pythia-1b-deduped", "reward", 55513)])
-# rm_record = RunRecord(**df.loc[("EleutherAI/pythia-6.9b-deduped", "reward", 55513)]) # larger (in some sense gold) RM
-
-######
-# RM model definition
-######
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.normal_(layer.weight, std=std)
@@ -117,12 +71,11 @@ class ScalarModel(PreTrainedModel):
         output = self.lm_backbone(**kwargs)
         reward = self.scalar_head(output.hidden_states[-1]) - self.config.bias
         return reward
-
+    
 
 ######
 # Utility functions
 ######
-
 
 def generate(lm_backbone, queries, tokenizer, generation_config):
     """generate in a way that does not affect padding tokens"""
@@ -139,18 +92,23 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
-def forward(model, query_responses, tokenizer):
+def forward(model, query_responses, labels, tokenizer, gather: bool = True):
     attention_mask = query_responses != tokenizer.pad_token_id
-    position_ids = attention_mask.cumsum(1) - attention_mask.long()
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    return model(
+    output = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        position_ids=position_ids,
         return_dict=True,
-        output_hidden_states=True,
     )
-
+    labels = labels[:, 1:].clone()
+    logits = output.logits[:, :-1, :]
+    loss_mask = (labels != tokenizer.pad_token_id)
+    if gather:
+        per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+        all_logps = (per_token_logps * loss_mask).sum(-1)
+    else:
+        all_logps = (logits.log_softmax(-1) * loss_mask.unsqueeze(2)).squeeze(2)
+    return all_logps
 
 def get_reward(model, query_responses, tokenizer):
     attention_mask = query_responses != tokenizer.pad_token_id
@@ -162,9 +120,7 @@ def get_reward(model, query_responses, tokenizer):
         output_hidden_states=True,
     )
     sequence_lengths = (torch.eq(query_responses, tokenizer.pad_token_id).long().argmax(-1) - 1).to(query_responses.device)
-    # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
     return reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths], reward_logits
-
 
 def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
     table = Table(show_lines=True)
@@ -176,168 +132,207 @@ def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
     console.print(table)
 
 
-######
-# Start
-######
+if __name__=="__main__":
+    console = Console()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name_or_path", type=str, required=True)
+    parser.add_argument("--key", type=str, required=True)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--n_samples", type=int, default=256)
 
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-tokenizer = AutoTokenizer.from_pretrained("EleutherAI/pythia-1b-deduped")
-tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-response_length = 80
-validation_generation_config = GenerationConfig(
-    max_new_tokens=response_length,
-    temperature=(0.01 + 1e-7),
-    top_k=0.0,
-    top_p=1.0,
-    do_sample=True,
-    pad_token_id=tokenizer.pad_token_id,
-    eos_token_id=tokenizer.eos_token_id,
-)
+    args = parser.parse_args()
+    print(args.key)
 
-sft_dataset = load_dataset("vwxyzjn/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_1706381144")
-base_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained("EleutherAI/pythia-1b-deduped").to(device)
-
-console.print("loading", sft_record)
-sft_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-    sft_record.hf_repo_id,
-    revision=sft_record.revision,
-    trust_remote_code=True,
-).to(device)
-console.print("loading", ppo_record)
-ppo_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-    ppo_record.hf_repo_id,
-    revision=ppo_record.revision,
-    trust_remote_code=True,
-).to(device)
-console.print("loading", dpo_record)
-dpo_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-    dpo_record.hf_repo_id,
-    revision=dpo_record.revision,
-    trust_remote_code=True,
-).to(device)
-console.print("loading", rm_record)
-scalar_model_config = ScalarModelConfig.from_pretrained(
-    rm_record.hf_repo_id,
-    revision=rm_record.revision,
-    trust_remote_code=True,
-)
-# hack to remove the path
-# models/EleutherAI/pythia-6.9b-deduped/sft_model_55513 -> EleutherAI/pythia-6.9b-deduped
-original_model = "/".join(scalar_model_config.base_config["_name_or_path"].split("/")[1:3])
-scalar_model_config.base_config["_name_or_path"] = original_model
-scalar_model_config.base_model = original_model
-rm: PreTrainedModel = ScalarModel.from_pretrained(
-    rm_record.hf_repo_id,
-    revision=rm_record.revision,
-    trust_remote_code=True,
-    config=scalar_model_config,
-).to(device)
-
-nchecks = 4
-colors = {
-    0: "on blue",
-    1: "on yellow",
-    2: "on yellow",
-    3: "on red",
-}
-latex_colors = {
-    0: "\sethlcolor{LightBlue}",
-    1: "\sethlcolor{LightYellow}",
-    2: "\sethlcolor{LightYellow}",
-    3: "\sethlcolor{LightRed}",
-}
-include_logits = False
-for i in range(len(sft_dataset["validation"])):
-    rich_table = defaultdict(list)
-    latex_table = defaultdict(list)
-    query = torch.LongTensor(sft_dataset["validation"][i : i + 1]["query_token"]).to(device)
-    context_length = query.shape[1]
-    query_reference_response = torch.cat((query, torch.LongTensor(tokenizer.encode(sft_dataset["validation"][i]["reference_response"])).to(device).unsqueeze(0)), dim=1)
-    for table in [rich_table, latex_table]:
-        table["Type"].append("Query")
-        table["Content"].append(tokenizer.decode(query[0], skip_special_tokens=True))
-        table["Score (RM)"].append("N/A")
-    with torch.no_grad():
-        model_stats = defaultdict(list)
-        for aligned_model, model_name in zip(
-            [sft_model, ppo_model, dpo_model],
-            ["SFT Model Response", "PPO Model Response", "DPO Model Response"],
-        ):
-            aligned_model_query_response = generate(aligned_model, query, tokenizer, validation_generation_config)
-            aligned_model_response = aligned_model_query_response[:, context_length:]
-            aligned_model_reward, aligned_model_reward_logits = get_reward(rm, aligned_model_query_response, tokenizer)
-            aligned_model_reward_logits = aligned_model_reward_logits.squeeze(-1)[:, context_length-1:]
-
-            # AI2 visualization https://allenai.github.io/re-align/tds.html
-            aligned_model_output = forward(aligned_model, aligned_model_query_response, tokenizer)
-            base_model_output = forward(base_model, aligned_model_query_response, tokenizer)
-            aligned_model_logits = aligned_model_output.logits[:, context_length - 1 : -1]
-            _, aligned_model_topk_indices = aligned_model_logits.topk(10)
-            base_model_logits = base_model_output.logits[:, context_length - 1 : -1]
-            _, base_model_topk_indices = base_model_logits.topk(10)
-            aligned_model_topk_indices[:, :, 0:1].expand(-1, -1, nchecks)
-            matches = aligned_model_topk_indices[:, :, 0:1].expand(-1, -1, nchecks) == base_model_topk_indices[:, :, 0:nchecks]
-            matched = matches.sum(2)
-            match_idx = matches.float().argmax(2)
-            final_matches = torch.where(matched > 0, match_idx, nchecks - 1)
-            stats = torch.stack([(final_matches == i).sum(1) for i in range(nchecks)]).T
-
-            final_matches = final_matches.tolist()
-            aligned_model_response = aligned_model_response.tolist()
-            for table in [rich_table, latex_table]:
-                table["Type"].append(model_name)
-            latex_table["Content"].append(
-                "".join(
-                    [
-                        f"{latex_colors[jt]}"  "\hl{" f"{tokenizer.decode(it)}" "}"
-                        for it, jt in zip(aligned_model_response[0], final_matches[0])
+    if not os.path.exists("release_runs.csv"):
+        import wandb
+        keys = {
+            "sft": "refactor-chosen-rejected3",
+            "reward": "refactor-chosen-rejected3",
+            "ppo_left_padding_new_nowhiten_reward": "refactor-chosen-rejected3",
+            "dpo": "refactor-chosen-rejected2",
+        }
+        runs = []
+        for exp_name, tag in keys.items():
+            runs.extend(list(wandb.Api().runs(
+                path=f"costa-huang/tldr_summarize",
+                filters={
+                    "$and": [
+                        {f"config.exp_name.value": exp_name},
+                        {"tags": {"$in": [tag]}},
                     ]
-                )
-            )
-            rich_table["Content"].append(
-                "".join(
-                    [
-                        f"[{colors[jt]}]{tokenizer.decode(it)}[/{colors[jt]}]"
-                        for it, jt in zip(aligned_model_response[0], final_matches[0])
-                    ]
-                )
-            )
-            for table in [rich_table, latex_table]:
-                table["Score (RM)"].append(str(round(aligned_model_reward[0][0].item(), 4)))
-                if include_logits:
-                    table["Type"].append(f"{model_name} Reward Logits")
-                    table["Content"].append([round(logit, 4) for logit in aligned_model_reward_logits[0].tolist()])
-                    table["Score (RM)"].append(str(round(aligned_model_reward[0][0].item(), 4)))
-            # table["Type"].append("Matched Color Counts")
-            # table["Content"].append(stats[0])
-        reference_reward, reference_reward_logits = get_reward(rm, query_reference_response, tokenizer)
-        reference_reward_logits = reference_reward_logits.squeeze(-1)[:, context_length-1:]
-        for table in [rich_table, latex_table]:
-            table["Type"].append("Reference response")
-            table["Content"].append(sft_dataset["validation"][i]["reference_response"])
-            table["Score (RM)"].append(str(round(reference_reward[0][0].item(), 4)))
-            if include_logits:
-                table["Type"].append("Reference Reward Logits")
-                table["Content"].append([round(logit, 4) for logit in reference_reward_logits[0].tolist()])
-                table["Score (RM)"].append(str(round(reference_reward[0][0].item(), 4)))
-
-        base_model_query_response = generate(base_model, query, tokenizer, validation_generation_config)
-        base_model_response = base_model_query_response[:, context_length:]
-        base_model_reward, base_model_reward_logits = get_reward(rm, base_model_query_response, tokenizer)
-        base_model_reward_logits = base_model_reward_logits.squeeze(-1)[:, context_length-1:]
-        for table in [rich_table, latex_table]:
-            table["Type"].append("Base Model Response")
-            table["Content"].append(tokenizer.decode(base_model_response[0], skip_special_tokens=True))
-            table["Score (RM)"].append(str(round(base_model_reward[0][0].item(), 4)))
-            if include_logits:
-                table["Type"].append("Base Model Reward Logits")
-                table["Content"].append([round(logit, 4) for logit in base_model_reward_logits[0].tolist()])
-                table["Score (RM)"].append(str(round(base_model_reward[0][0].item(), 4)))
+                }
+            )))
+        table = defaultdict(list)
+        for i in range(len(runs)):
+            table["base_model"].append(runs[i].config["base_model"])
+            table["exp"].append(runs[i].config["exp_name"])
+            table["seed"].append(runs[i].config["seed"])
+            table["wandb_url"].append(runs[i].url)
+            table["hf_repo_url"].append(runs[i].config["hf_repo_url"])
+            table["hf_repo_id"].append(runs[i].config["hf_repo_id"])
+            table["revision"].append(runs[i].config["run_name"])
+        df = pd.DataFrame(table)
+        df.to_csv("release_runs.csv", index=False)
+    else:
+        df = pd.read_csv("release_runs.csv")
 
 
-    rich_df = pd.DataFrame(rich_table)
-    latex_df = pd.DataFrame(latex_table)
-    print_rich_table("Results", rich_df, console)
-    # print(latex_df.to_latex(index=False))
-    if input("Continue? (press `n` to stop) ") == "n":
-        break
+    df = df.groupby(["base_model", "exp", "seed"]).agg(lambda x: x.tolist()[0])
+    model_seed = 44413
+    sft_record = RunRecord(**df.loc[("EleutherAI/pythia-1b-deduped", "sft", model_seed)])
+    rm_record = RunRecord(**df.loc[("EleutherAI/pythia-6.9b-deduped", "reward", model_seed)]) # larger (in some sense gold) RM
+
+    ######
+    # Start
+    ######
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/pythia-1b-deduped")
+    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    response_length = 128
+    validation_generation_config = GenerationConfig(
+        max_new_tokens=response_length,
+        temperature=(0.01 + 1e-7),
+        top_k=0.0,
+        top_p=1.0,
+        do_sample=True,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+
+    sft_dataset = load_dataset("vwxyzjn/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_1706381144")
+
+    console.print("loading", sft_record)
+    sft_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
+        sft_record.hf_repo_id,
+        revision=sft_record.revision,
+        use_cache=True,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+    ).to(device)
+
+    model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path,
+        torch_dtype=torch.bfloat16,
+        use_cache=True,
+        trust_remote_code=True,
+    ).to(device)
+
+    table = defaultdict(list)
+    import random
+    random.seed(args.seed)
+    sft_dataset = sft_dataset['validation']
+    sft_dataset = sft_dataset.shuffle(args.seed)
+    sft_dataset = sft_dataset.select(range(args.n_samples))
+
+    all_model_query_responses = []
+    all_reference_query_responses = []
+    context_lengths = []
+
+    for i in tqdm(range(len(sft_dataset))):
+        with torch.no_grad():
+            query = torch.LongTensor(sft_dataset[i : i + 1]["query_token"]).to(device)
+            query_reference_response = torch.cat((query, torch.LongTensor(tokenizer.encode(sft_dataset[i]["reference_response"])).unsqueeze(0).to(device)), dim=1)
+            context_length = query.shape[1]
+            table['Prompt'] = tokenizer.decode(query[0], skip_special_tokens=True)
+            model_query_response = generate(model, query, tokenizer, validation_generation_config)
+
+            all_model_query_responses.append(model_query_response.cpu())
+            all_reference_query_responses.append(query_reference_response.cpu())
+            context_lengths.append(context_length)
+            model_response = model_query_response[:, context_length:]
+            reference_response = query_reference_response[:, context_length:]
+
+            model_logprobs = forward(model, model_query_response, model_query_response, tokenizer, gather=False)
+            reference_model_logprobs = forward(sft_model, model_query_response, model_query_response, tokenizer, gather=False)
+            kl_div = torch.nn.functional.kl_div(input=reference_model_logprobs, target=model_logprobs, log_target=True, reduction='none').sum(dim=(1,2))
+            table[f"{args.key} Model Response"].append(tokenizer.decode(model_response[0], skip_special_tokens=True).strip())
+            table["Reference Model Response"].append(tokenizer.decode(reference_response[0], skip_special_tokens=True).strip())
+            table['KL Divergence'].append(kl_div.item())
+
+    model.to('cpu')
+    sft_model.to('cpu')
+    del model, sft_model
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    scalar_model_config = ScalarModelConfig.from_pretrained(
+        rm_record.hf_repo_id,
+        revision=rm_record.revision,
+        trust_remote_code=True,
+    )
+
+    original_model = "/".join(scalar_model_config.base_config["_name_or_path"].split("/")[1:3])
+    scalar_model_config.base_config["_name_or_path"] = original_model
+    scalar_model_config.base_model = original_model
+    rm: PreTrainedModel = ScalarModel.from_pretrained(
+        rm_record.hf_repo_id,
+        revision=rm_record.revision,
+        torch_dtype=torch.float16,
+        device_map='cuda',
+        trust_remote_code=True,
+        config=scalar_model_config,
+    )
+
+    for context_length, model_query_response, reference_query_response in tzip(context_lengths, all_model_query_responses, all_reference_query_responses):
+        with torch.no_grad():
+            model_query_response = model_query_response.to(device)
+            model_reward, model_reward_logits = get_reward(rm, model_query_response, tokenizer)
+            model_reward_logits = model_reward_logits.squeeze(-1)[:, context_length-1:]
+            table["Model Score (RM)"].append(model_reward[0][0].item())
+            table["Model Length"].append(model_query_response.shape[1] - context_length)
+
+            reference_query_response = reference_query_response.to(device)
+            reference_reward, reference_reward_logits = get_reward(rm, reference_query_response, tokenizer)
+            reference_reward_logits = reference_reward_logits.squeeze(-1)[:, context_length-1:]
+            table["Reference Score (RM)"].append(reference_reward[0][0].item())
+            table["Reference Length"].append(reference_query_response.shape[1] - context_length)
+
+            if reference_reward[0][0].item() < model_reward[0][0].item():
+                table['Policy Wins'].append('wins')
+            elif reference_reward[0][0].item() > model_reward[0][0].item():
+                table['Policy Wins'].append('lose')
+            else:
+                table['Policy Wins'].append('tie')
+    
+    df = pd.DataFrame(table)
+    df.to_csv("results/table_results.csv", index=False)
+    print_rich_table("Results", df.head(15), console)
+
+    kl_div = table['KL Divergence']
+    win_rate = table['Policy Wins']
+    policy_wins = sum([1 for ele in win_rate if ele == 'wins'])
+    reference_wins = sum([1 for ele in win_rate if ele == 'lose'])
+
+    policy_lengths = table['Model Length']
+    reference_lengths = table['Reference Length']
+
+    policy_scores = table["Model Score (RM)"]
+    reference_scores = table['Reference Score (RM)']
+    results = {
+        'total': args.n_samples,
+        'seed': args.seed,
+        'judge' : rm_record.hf_repo_id,
+        'candidate': {
+            'name': args.key,
+            'wins': policy_wins,
+            'lengths': sum(policy_lengths) / len(policy_lengths),
+            'scores': sum(policy_scores) / len(policy_scores),
+            'KL divergence': sum(kl_div) / len(kl_div)
+        },
+        'baseline': {
+            'name': 'reference',
+            'wins': reference_wins,
+            'lengths': sum(reference_lengths) / len(reference_lengths),
+            'scores': sum(reference_scores) / len(reference_scores),
+        },
+    }
+
+    import json
+    with open('results/results.json', 'a+') as f:
+        json.dump(results, f)
+        f.write('\n')
+
+
+
+    
