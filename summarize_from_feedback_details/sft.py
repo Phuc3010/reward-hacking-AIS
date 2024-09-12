@@ -58,7 +58,7 @@ class Args:
     """Whether to run evaluation"""
 
     # optimizer args
-    eps: float = 1e-5
+    eps: float = 1e-8
     """the epsilon value for the optimizer"""
     lr: float = 3e-6
     """the learning rate"""
@@ -66,7 +66,7 @@ class Args:
     """Which optimizer to use"""
     scheduler: str = "cosine"
     """Which scheduler to use"""
-    warm_up_steps: int = 0
+    warm_up_steps: int = 150
     """Number of warm up steps for the scheduler"""
 
     # various batch sizes
