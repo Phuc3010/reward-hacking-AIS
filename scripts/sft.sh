@@ -2,13 +2,13 @@ export CUDA_VISIBLE_DEVICES=3,4
 SEED=0
 
 if [ -z "$MODEL" ]; then
-    # MODEL=EleutherAI/pythia-6.9b-deduped
+    MODEL=EleutherAI/pythia-6.9b-deduped
     # MODEL=EleutherAI/pythia-2.8b-deduped
     # MODEL=EleutherAI/pythia-1b-deduped
     # MODEL=EleutherAI/pythia-410m-deduped
     # MODEL=EleutherAI/pythia-160m-deduped
     # MODEL=openai-community/gpt2-large
-    MODEL=meta-llama/Llama-2-7b-hf
+    # MODEL=meta-llama/Llama-2-7b-hf
 fi
 LR=2e-5
 
