@@ -57,7 +57,7 @@ class Args:
     """Whether to run evaluation"""
 
     # optimizer args
-    eps: float = 1e-8
+    eps: float = 1e-5
     """the epsilon value for the optimizer"""
     lr: float = 3e-6
     """the learning rate"""
@@ -65,7 +65,7 @@ class Args:
     """Which optimizer to use"""
     scheduler: str = "cosine"
     """Which scheduler to use"""
-    warm_up_steps: int = 100
+    warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
 
     # various batch sizes
@@ -257,6 +257,7 @@ def evaluate(args: Args, accelerator, tokenizer, model, dataloader):
                 items["rejected"].append(tokenizer.decode(data["rejected_token"][i]))
                 items["batch"].append(data["batch"][i])
                 items["split"].append(data["split"][i])
+                items["confidence"].append(data["extra.confidence"][i].item())
                 items["choice"].append(data["choice"][i].item())
                 items["policies"].append(data["policies"][i])
                 items["chosen_policy"].append(data["chosen_policy"][i])
@@ -274,7 +275,7 @@ if __name__ == "__main__":
     local_seed = args.seed + accelerator.process_index * 100003  # Prime
 
     # load dataset
-    dataset = load_dataset('DatPySci/summarize_from_feedback_oai_preprocessing_pythia-6.9b-gold', split='train')
+    dataset = load_dataset(args.label_dataset, split="train")
     dataset = dataset.shuffle(seed=local_seed)
     dataset = dataset.select(range(args.total_episodes))
     dataset = dataset.with_format(
@@ -292,8 +293,8 @@ if __name__ == "__main__":
     dataloader = DataLoader(dataset, batch_size=args.local_micro_batch_size)
     eval_datasets = []
     eval_dataloaders = {}
-    for split in ["test"]:
-        validation_dataset= load_dataset("DatPySci/summarize_from_feedback_oai_preprocessing_pythia-6.9b-gold", split=split)
+    for split in ["validation", "validation_cnndm"]:
+        validation_dataset = load_dataset(args.label_dataset, split=split).flatten()
         validation_dataset = validation_dataset.with_format(
             "torch",
             columns=[
@@ -305,6 +306,7 @@ if __name__ == "__main__":
                 "query_rejected_token",
                 "batch",
                 "split",
+                "extra.confidence",
                 "chosen_policy",
                 "rejected_policy",
                 "policies",
@@ -352,14 +354,11 @@ if __name__ == "__main__":
     np.random.seed(local_seed)
     torch.manual_seed(local_seed)
     torch.backends.cudnn.deterministic = True
-
-    model_config = AutoConfig.from_pretrained('vwxyzjn/EleutherAI_pythia-1b-deduped__sft__tldr')
+    model_config = AutoConfig.from_pretrained(args.sft_model_path)
     scalar_model_config = ScalarModelConfig(
-        'vwxyzjn/EleutherAI_pythia-1b-deduped__sft__tldr',
+        base_model=args.sft_model_path,
         base_config=model_config,
         hidden_size=model_config.hidden_size,
-        revision='sft__44413__1708611267',
-        trust_remote_code=True,
     )
     if len(args.reward_model_path) == 0:
         model: PreTrainedModel = ScalarModel(scalar_model_config)
@@ -441,6 +440,9 @@ if __name__ == "__main__":
             for batch, row in evaluate_df[["batch", "accuracy"]].groupby(["batch"]).mean().iterrows():
                 writer.add_scalar(f"eval/rm/{eval_split}/accuracy/batch/{batch}", row["accuracy"], global_step)
                 accelerator.print(f"eval/rm/{eval_split}/accuracy/batch/{batch}: {row['accuracy']}")
+            for confi, row in evaluate_df[["confidence", "accuracy"]].groupby(["confidence"]).mean().iterrows():
+                writer.add_scalar(f"eval/rm/{eval_split}/accuracy/confidence/{confi}", row["accuracy"], global_step)
+                accelerator.print(f"eval/rm/{eval_split}/accuracy/confidence/{confi}: {row['accuracy']}")
             writer.add_scalar(f"eval/rm/{eval_split}/accuracy", evaluate_df["accuracy"].mean(), global_step)
             accelerator.print(f"eval/rm/{eval_split}/accuracy: {evaluate_df['accuracy'].mean()}")
             if accelerator.is_main_process:
