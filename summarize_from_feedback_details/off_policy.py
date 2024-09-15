@@ -57,7 +57,7 @@ class Args:
     """Whether to run evaluation"""
 
     # optimizer args
-    eps: float = 1e-5
+    eps: float = 1e-8
     """the epsilon value for the optimizer"""
     lr: float = 1e-6
     """the learning rate"""
