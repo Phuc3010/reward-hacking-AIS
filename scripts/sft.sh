@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=3,4
+export CUDA_VISIBLE_DEVICES=0,1
 SEED=0
 
 if [ -z "$MODEL" ]; then
@@ -10,7 +10,7 @@ if [ -z "$MODEL" ]; then
     # MODEL=openai-community/gpt2-large
     # MODEL=meta-llama/Llama-2-7b-hf
 fi
-LR=2e-5
+LR=1e-5
 
 REWARD_MODEL_PATH=models/$MODEL/reward_model_$SEED
 SFT_MODEL_PATH=models/$MODEL/sft_model_$SEED
@@ -39,6 +39,7 @@ poetry run accelerate launch --config_file deepspeed.yaml \
 
 poetry run accelerate launch --config_file deepspeed.yaml \
     summarize_from_feedback_details/reward.py \
+    --sft_model_path=$SFT_MODEL_PATH \
     --base_model=$MODEL \
     --warm_up_steps=150\
     --local_micro_batch_size=16\
@@ -48,6 +49,6 @@ poetry run accelerate launch --config_file deepspeed.yaml \
     --deepspeed \
     --run_eval \
     --track \
-    --output_dir=$SFT_MODEL_PATH\
+    --output_dir=$REWARD_MODEL_PATH\
     --local_eval_batch_size=$local_eval_batch_size \
     --seed=$SEED

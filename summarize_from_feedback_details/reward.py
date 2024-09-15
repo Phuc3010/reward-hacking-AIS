@@ -99,10 +99,8 @@ class Args:
     """the path to the reward model"""
     sft_model_path: str = "EleutherAI/pythia-160m"
     """the path to the sft model"""
-    label_dataset: str = "vwxyzjn/summarize_from_feedback_oai_preprocessing_1706381144"
-    """the name of the dataset to use for labels in `https://huggingface.co/datasets/vwxyzjn/lm-human-preferences`"""
-
-    # wandb and HF tracking configs
+    label_dataset: str = 'DatPySci/tldr_preference_pythia-6.9b-gold'
+    
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "tldr_summarize"
@@ -132,7 +130,7 @@ def parse_args() -> tuple[Args, Accelerator]:
     args.batch_size = int(args.local_batch_size * args.world_size)
     time_tensor = torch.tensor(int(time.time()), device=accelerator.device)
     time_int = broadcast(time_tensor, 0).item()  # avoid different timestamps across processes
-    args.run_name = f"{args.exp_name}__{args.seed}__{time_int}"
+    args.run_name = f"{args.exp_name}_seed_{args.seed}"
     if args.push_to_hub:
         if args.hf_repo_id is None: # auto-generate one
             args.hf_repo_id = f"{args.base_model.replace('/', '_')}__{args.exp_name}__tldr"
@@ -257,7 +255,6 @@ def evaluate(args: Args, accelerator, tokenizer, model, dataloader):
                 items["rejected"].append(tokenizer.decode(data["rejected_token"][i]))
                 items["batch"].append(data["batch"][i])
                 items["split"].append(data["split"][i])
-                items["confidence"].append(data["extra.confidence"][i].item())
                 items["choice"].append(data["choice"][i].item())
                 items["policies"].append(data["policies"][i])
                 items["chosen_policy"].append(data["chosen_policy"][i])
@@ -293,8 +290,9 @@ if __name__ == "__main__":
     dataloader = DataLoader(dataset, batch_size=args.local_micro_batch_size)
     eval_datasets = []
     eval_dataloaders = {}
-    for split in ["validation", "validation_cnndm"]:
+    for split in ["test"]:
         validation_dataset = load_dataset(args.label_dataset, split=split).flatten()
+        validation_dataset = validation_dataset.select(range(256))
         validation_dataset = validation_dataset.with_format(
             "torch",
             columns=[
@@ -306,7 +304,6 @@ if __name__ == "__main__":
                 "query_rejected_token",
                 "batch",
                 "split",
-                "extra.confidence",
                 "chosen_policy",
                 "rejected_policy",
                 "policies",
@@ -354,12 +351,15 @@ if __name__ == "__main__":
     np.random.seed(local_seed)
     torch.manual_seed(local_seed)
     torch.backends.cudnn.deterministic = True
-    model_config = AutoConfig.from_pretrained(args.sft_model_path)
+
+    model_config = AutoConfig.from_pretrained('vwxyzjn/EleutherAI_pythia-1b-deduped__sft__tldr')
+
     scalar_model_config = ScalarModelConfig(
-        base_model=args.sft_model_path,
+        base_model='vwxyzjn/EleutherAI_pythia-1b-deduped__sft__tldr',
         base_config=model_config,
         hidden_size=model_config.hidden_size,
     )
+
     if len(args.reward_model_path) == 0:
         model: PreTrainedModel = ScalarModel(scalar_model_config)
     else:
@@ -397,6 +397,25 @@ if __name__ == "__main__":
     gradient_accumulation_idx = 0
     global_step = 0
     update = 0
+    if args.run_eval:
+        for eval_split in eval_dataloaders:
+            evaluate_df = evaluate(args, accelerator, tokenizer, model, eval_dataloaders[eval_split])
+            for split, row in evaluate_df[["split", "accuracy"]].groupby(["split"]).mean().iterrows():
+                writer.add_scalar(f"eval/rm/{eval_split}/accuracy/split/{split}", row["accuracy"], global_step)
+                accelerator.print(f"eval/rm/{eval_split}/accuracy/split/{split}: {row['accuracy']}")
+            for batch, row in evaluate_df[["batch", "accuracy"]].groupby(["batch"]).mean().iterrows():
+                writer.add_scalar(f"eval/rm/{eval_split}/accuracy/batch/{batch}", row["accuracy"], global_step)
+                accelerator.print(f"eval/rm/{eval_split}/accuracy/batch/{batch}: {row['accuracy']}")
+            writer.add_scalar(f"eval/rm/{eval_split}/accuracy", evaluate_df["accuracy"].mean(), global_step)
+            accelerator.print(f"eval/rm/{eval_split}/accuracy: {evaluate_df['accuracy'].mean()}")
+            if accelerator.is_main_process:
+                os.makedirs(f"eval_tables/{args.run_name}", exist_ok=True)
+                evaluate_df.to_csv(f"eval_tables/{args.run_name}/eval_{eval_split}_{update}.csv")
+                if args.track:
+                    wandb.log({f"samples/{eval_split}/query_responses": wandb.Table(dataframe=evaluate_df)}, step=update)
+            del evaluate_df
+            torch.cuda.empty_cache()
+        
     for epoch in range(args.num_train_epochs):
         accelerator.print(f"epoch: {epoch}")
         for data in dataloader:
@@ -430,7 +449,6 @@ if __name__ == "__main__":
                 accelerator.print(
                     f"{train_accuracy=}, {scheduler.get_last_lr()=}, {optimizer.param_groups[0]['lr']=}, {update=}"
                 )
-
     if args.run_eval:
         for eval_split in eval_dataloaders:
             evaluate_df = evaluate(args, accelerator, tokenizer, model, eval_dataloaders[eval_split])
@@ -440,9 +458,6 @@ if __name__ == "__main__":
             for batch, row in evaluate_df[["batch", "accuracy"]].groupby(["batch"]).mean().iterrows():
                 writer.add_scalar(f"eval/rm/{eval_split}/accuracy/batch/{batch}", row["accuracy"], global_step)
                 accelerator.print(f"eval/rm/{eval_split}/accuracy/batch/{batch}: {row['accuracy']}")
-            for confi, row in evaluate_df[["confidence", "accuracy"]].groupby(["confidence"]).mean().iterrows():
-                writer.add_scalar(f"eval/rm/{eval_split}/accuracy/confidence/{confi}", row["accuracy"], global_step)
-                accelerator.print(f"eval/rm/{eval_split}/accuracy/confidence/{confi}: {row['accuracy']}")
             writer.add_scalar(f"eval/rm/{eval_split}/accuracy", evaluate_df["accuracy"].mean(), global_step)
             accelerator.print(f"eval/rm/{eval_split}/accuracy: {evaluate_df['accuracy'].mean()}")
             if accelerator.is_main_process:
@@ -452,55 +467,6 @@ if __name__ == "__main__":
                     wandb.log({f"samples/{eval_split}/query_responses": wandb.Table(dataframe=evaluate_df)}, step=update)
             del evaluate_df
             torch.cuda.empty_cache()
-
-    norm_dataset = load_dataset(args.query_dataset, split="train")
-    norm_dataset = norm_dataset.with_format("torch", columns=["query_token", "reference_response_token", "query_reference_response_token"])
-    norm_dataset = norm_dataset.shuffle(seed=local_seed)
-    norm_dataloader = DataLoader(norm_dataset, batch_size=args.local_eval_batch_size)
-    items = defaultdict(list)
-    norm_dataloader = accelerator.prepare(norm_dataloader)
-    rtol = 1e-2
-    with torch.no_grad():
-        for data in tqdm(norm_dataloader):
-            reference_responses = data["reference_response_token"].to(device, non_blocking=True)
-            queries = data["query_token"].to(device, non_blocking=True)
-            query_responses = data["query_reference_response_token"].to(device, non_blocking=True)
-            cat_query_responses = torch.cat((queries, reference_responses), dim=1)
-            cat_predicted_reward = get_reward(model, cat_query_responses, tokenizer, context_length=queries.shape[1])
-            predicted_reward = get_reward(model, query_responses, tokenizer)
-            unexpecte_reward_diff = predicted_reward - cat_predicted_reward
-            unexpecte_reward_diff_gt_rtol = unexpecte_reward_diff.abs() > rtol
-            unexpecte_reward_diff = accelerator.gather(unexpecte_reward_diff)
-            unexpecte_reward_diff_gt_rtol = accelerator.gather(unexpecte_reward_diff_gt_rtol)
-            predicted_reward = accelerator.gather(predicted_reward)
-            queries = accelerator.gather(queries)
-            reference_responses = accelerator.gather(reference_responses)
-            for i in range(len(predicted_reward)):
-                items["query"].append(tokenizer.decode(queries[i], skip_special_tokens=True))
-                items["reference_response"].append(tokenizer.decode(reference_responses[i]))
-                items["predicted_reward"].append(predicted_reward[i].item())
-                items["unexpecte_reward_diff"].append(unexpecte_reward_diff[i].item())
-                items["unexpecte_reward_diff_gt_rtol"].append(unexpecte_reward_diff_gt_rtol[i].item())
-
-    if accelerator.is_main_process:
-        norm_df = pd.DataFrame(items)
-        os.makedirs(f"eval_tables/{args.run_name}", exist_ok=True)
-        norm_ds = Dataset.from_pandas(norm_df)
-        # norm_df.to_csv(f"eval_tables/{args.run_name}/eval_{update}_normalized.csv")
-        norm_ds.save_to_disk(f"eval_tables/{args.run_name}/eval_{update}_normalized")
-        if args.track:
-            wandb.log({"samples/normalized": wandb.Table(dataframe=norm_df)}, step=update)
-        stats = {
-            "mean": norm_df["predicted_reward"].mean(),
-            "std": norm_df["predicted_reward"].std(),
-            "max": norm_df["predicted_reward"].max(),
-            "min": norm_df["predicted_reward"].min(),
-            "unexpecte_reward_diff_mean": norm_df["unexpecte_reward_diff"].mean(),
-            "unexpecte_reward_diff_gt_rtol_mean": norm_df["unexpecte_reward_diff_gt_rtol"].mean(),
-        }
-        for stat_name, stat_value in stats.items():
-            writer.add_scalar(f"eval/rm/normalized_{stat_name}", stat_value, global_step)
-            accelerator.print(f"Normalized Reward {stat_name.capitalize()}: {stat_value}")
 
     # save model
     if args.output_dir and args.num_train_epochs > 0:
@@ -517,7 +483,6 @@ if __name__ == "__main__":
         unwrapped: PreTrainedModel = accelerator.unwrap_model(model)
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
-            unwrapped.config.bias = norm_df["predicted_reward"].mean()
             unwrapped.save_pretrained(
                 args.output_dir,
                 is_main_process=accelerator.is_main_process,
