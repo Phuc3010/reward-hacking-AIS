@@ -20,15 +20,13 @@ local_eval_batch_size=2 # smaller fits better on GPU
 
 
 betas=("0.01" "0.05" "0.1")
-# losses=("length_IS" "dpo" "clip")
-losses=("dpo")
+losses=("length_IS" "dpo" "clip")
 
 for beta in "${betas[@]}"; do
 for loss_name in "${losses[@]}"; do
         # --reward_model_path=$REWARD_MODEL_PATH \
     OFF_POLICY_MODEL_PATH=models/$MODEL/${loss_name}_policy_beta_${beta}_$SEED
     poetry run accelerate launch --config_file deepspeed.yaml \
-        --main_process_port=0 \
         summarize_from_feedback_details/off_policy.py \
         --base_model=$MODEL \
         --exp_name=${loss_name}_pythia-1b_beta-${beta}\
