@@ -57,7 +57,7 @@ class Args:
     """Whether to run evaluation"""
 
     # optimizer args
-    eps: float = 1e-5
+    eps: float = 1e-8
     """the epsilon value for the optimizer"""
     lr: float = 3e-6
     """the learning rate"""
@@ -273,6 +273,13 @@ if __name__ == "__main__":
 
     # load dataset
     dataset = load_dataset(args.label_dataset, split="train")
+    def swap_labels(ex):
+        if ex['chosen_score'] < ex['rejected_score']:
+            ex['chosen_token'], ex['rejected_token'] = ex['rejected_token'], ex['chosen_token']
+            ex['query_chosen_token'], ex['query_rejected_token'] = ex['query_rejected_token'], ex['query_chosen_token']
+        return ex
+    
+    dataset = dataset.map(swap_labels, num_proc=8)
     dataset = dataset.shuffle(seed=local_seed)
     dataset = dataset.select(range(args.total_episodes))
     dataset = dataset.with_format(
@@ -293,6 +300,7 @@ if __name__ == "__main__":
     for split in ["test"]:
         validation_dataset = load_dataset(args.label_dataset, split=split).flatten()
         validation_dataset = validation_dataset.select(range(256))
+        validation_dataset = validation_dataset.map(swap_labels, num_proc=8)
         validation_dataset = validation_dataset.with_format(
             "torch",
             columns=[

@@ -324,6 +324,13 @@ if __name__ == "__main__":
     
     # load dataset
     dataset = load_dataset('DatPySci/tldr_preference_pythia-6.9b-gold', split='train')
+    def swap_labels(ex):
+        if ex['chosen_score'] < ex['rejected_score']:
+            ex['chosen_token'], ex['rejected_token'] = ex['rejected_token'], ex['chosen_token']
+            ex['query_chosen_token'], ex['query_rejected_token'] = ex['query_rejected_token'], ex['query_chosen_token']
+        return ex
+    
+    dataset = dataset.map(swap_labels, num_proc=8)
     dataset = dataset.shuffle(seed=local_seed)
     dataset = dataset.select(range(args.total_episodes))
     dataset = dataset.with_format(
@@ -345,6 +352,8 @@ if __name__ == "__main__":
     eval_dataloaders = {}
     for split in ["test"]:
         validation_dataset= load_dataset("DatPySci/tldr_preference_pythia-6.9b-gold", split=split)
+        validation_dataset = validation_dataset.select(range(256))
+        validation_dataset = validation_dataset.map(swap_labels, num_proc=8)
         validation_dataset = validation_dataset.with_format(
             "torch",
             columns=[
