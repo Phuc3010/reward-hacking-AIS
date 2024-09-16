@@ -7,16 +7,15 @@ if [ -z "$MODEL" ]; then
     MODEL=EleutherAI/pythia-1b-deduped
     # MODEL=EleutherAI/pythia-410m-deduped
 fi
-LR=1e-6
+# LR=1e-6
+LR=5e-7
 
 REWARD_MODEL_PATH=models/$MODEL/reward_model_$SEED
 SFT_MODEL_PATH=models/$MODEL/sft_model_$SEED
 
 # vary the following parameters to fit your GPU memory
-local_rollout_forward_batch_size=2 # smaller fits better on GPU
 gradient_accumulation_steps=8 # bigger fits better on GPU
 local_micro_batch_size=4 # smaller fits better on GPU
-local_eval_batch_size=2 # smaller fits better on GPU
 
 
 betas=("0.01" "0.05" "0.1")
@@ -45,7 +44,7 @@ for loss_name in "${losses[@]}"; do
         --gradient_accumulation_steps=$gradient_accumulation_steps\
         --deepspeed \
         --run_eval \
-        --no-track \
+        --track \
         --push_to_hub \
         --local_eval_batch_size=1 \
         --seed=$SEED
