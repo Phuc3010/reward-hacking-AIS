@@ -33,9 +33,9 @@ for loss_name in "${losses[@]}"; do
         --base_model=$MODEL \
         --exp_name=${loss_name}_pythia-1b_beta-${beta}\
         --loss_name=$loss_name\
+        --optimizer=rmsprop\
         --num_train_epochs=$epoch\
         --warm_up_steps=$((epoch == 1 ? 150 : 450))\
-        --num_train_epochs=1\
         --sft_model_path=$SFT_MODEL_PATH \
         --output_dir=$OFF_POLICY_MODEL_PATH \
         --lr=$LR\
