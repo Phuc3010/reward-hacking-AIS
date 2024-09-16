@@ -61,7 +61,7 @@ class Args:
     """the epsilon value for the optimizer"""
     lr: float = 1e-6
     """the learning rate"""
-    optimizer: Literal["adam", "adamw"] = "adamw"
+    optimizer: Literal["adam", "adamw", "rmsprop"] = "adamw"
     """Which optimizer to use"""
     scheduler: str = "cosine"
     """Which scheduler to use"""
@@ -446,6 +446,8 @@ if __name__ == "__main__":
         optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, eps=args.eps)
+    else:
+        optimizer = optim.RMSprop(model.parameters(), lr=args.lr)
     
     scheduler = get_scheduler(
         args.scheduler,

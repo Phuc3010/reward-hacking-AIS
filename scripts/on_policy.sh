@@ -18,22 +18,21 @@ gradient_accumulation_steps=8 # bigger fits better on GPU
 local_micro_batch_size=4 # smaller fits better on GPU
 local_eval_batch_size=2 # smaller fits better on GPU
 
-poetry run accelerate launch --config_file deepspeed.yaml \
-    summarize_from_feedback_details/reward.py \
-    --base_model=$MODEL \
-    --sft_model_path=$SFT_MODEL_PATH \
-    --warm_up_steps=150 \
-    --exp_name=reward_pythia-1b \
-    --local_micro_batch_size=4\
-    --gradient_accumulation_steps=8\
-    --lr=$LR \
-    --deepspeed \
-    --run_eval \
-    --track \
-    --output_dir=$REWARD_MODEL_PATH \
-    --push_to_hub \
-    --local_eval_batch_size=$local_eval_batch_size \
-    --seed=$SEED
+# poetry run accelerate launch --config_file deepspeed.yaml \
+#     summarize_from_feedback_details/reward.py \
+#     --base_model=$MODEL \
+#     --sft_model_path=$SFT_MODEL_PATH \
+#     --warm_up_steps=150 \
+#     --exp_name=reward_pythia-1b \
+#     --local_micro_batch_size=4\
+#     --gradient_accumulation_steps=8\
+#     --lr=$LR \
+#     --deepspeed \
+#     --run_eval \
+#     --track \
+#     --output_dir=$REWARD_MODEL_PATH \
+#     --local_eval_batch_size=$local_eval_batch_size \
+#     --seed=$SEED
 
 poetry run accelerate launch --config_file deepspeed.yaml \
     --main_process_port=2950 \
@@ -41,16 +40,17 @@ poetry run accelerate launch --config_file deepspeed.yaml \
     --gradient_accumulation_steps=$gradient_accumulation_steps \
     --warm_up_steps=450 \
     --local_micro_batch_size=$local_micro_batch_size \
+    --response_length=64 \
     --base_model=$MODEL \
     --num_updates=1450\
+    --optimizer=rmsprop \
     --num_train_epochs=3\
     --sft_model_path=$SFT_MODEL_PATH \
-    --save_steps=23168\
+    --save_steps=27456 \
     --reward_model_path=$REWARD_MODEL_PATH \
-    --lr=$LR \
+    --lr=5e-7 \
     --deepspeed \
     --run_eval \
     --track \
     --output_dir=$POLICY_MODEL_PATH \
-    --push_to_hub \
     --seed=$SEED

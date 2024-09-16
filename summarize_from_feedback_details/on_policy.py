@@ -60,11 +60,11 @@ class Args:
     """Whether to run evaluation"""
 
     # optimizer args
-    eps: float = 1e-5
+    eps: float = 1e-8
     """the epsilon value for the optimizer"""
     lr: float = 3e-6
     """the learning rate"""
-    optimizer: Literal["adam", "adamw"] = "adamw"
+    optimizer: Literal["adam", "adamw", "rmsprop"] = "adamw"
     """Which optimizer to use"""
     scheduler: str = "cosine"
     """Which scheduler to use"""
@@ -113,10 +113,10 @@ class Args:
     """the truncation token id"""
     temperature: float = 1.0
     """the sampling temperature"""
-    penalty_reward_value: int = -1
-    """the reward value for responses that do not contain `truncate_token_id`"""
+    penalty_reward_value: int = 1.0
+    """the reward value for completion_ids that do not contain `truncate_token_id`"""
     non_eos_penalty: bool = True
-    """whether to penalize responses that do not contain `truncate_token_id`"""
+    """whether to penalize completion_ids that do not contain `truncate_token_id`"""
     offload: bool = False
     """Whether to offload ref policy and reward model to CPU"""
     reward_model_path: str = ""
@@ -319,12 +319,13 @@ def first_true_indices(bools, dtype=torch.long):
     return torch.min(zero_or_index, dim=-1).values
 
 
-def truncate_response(args, tokenizer, responses):
-    trunc_idxs = first_true_indices(responses == args.truncate_token_id).unsqueeze(-1)
-    new_size = [1] * (len(responses.size()) - 1) + [responses.shape[1]]
-    idxs = torch.arange(responses.shape[1], device=responses.device).view(*new_size)
-    postprocessed_responses = torch.masked_fill(responses, idxs > trunc_idxs, tokenizer.pad_token_id)
-    return postprocessed_responses
+def truncate_response(args, tokenizer, completion_ids):
+    trunc_idxs = first_true_indices(completion_ids == args.truncate_token_id).unsqueeze(-1)
+    new_size = [1] * (len(completion_ids.size()) - 1) + [completion_ids.shape[1]]
+    idxs = torch.arange(completion_ids.shape[1], device=completion_ids.device).view(*new_size)
+    completion_ids = torch.masked_fill(completion_ids, idxs > trunc_idxs, tokenizer.pad_token_id)
+    mask = torch.masked_fill(torch.ones_like(completion_ids), idxs > trunc_idxs, 0)
+    return completion_ids, mask
 
 
 def forward(model, query_responses, tokenizer):
@@ -356,15 +357,15 @@ def evaluate(reward_model, policy, tokenizer, dataloader, generation_config, sam
                 tokenizer,
                 generation_config,
             )
-            responses = query_responses[:, context_length:]
-            postprocessed_responses = truncate_response(args, tokenizer, responses)
-            postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
-            _, score, _ = get_reward(reward_model, postprocessed_query_responses, tokenizer, queries.shape[1])
+            completion_ids = query_responses[:, context_length:]
+            completion_ids = truncate_response(args, tokenizer, completion_ids)
+            prompt_completion_ids = torch.cat((queries, completion_ids), 1)
+            _, score, _ = get_reward(reward_model, prompt_completion_ids, tokenizer, queries.shape[1])
 
             eval_storage["query_token"].extend(queries)
             eval_storage["reference_response_token"].extend(reference_response_token)
             eval_storage["reference_score"].append(reference_score)
-            eval_storage["postprocessed_response_token"].extend(postprocessed_responses)
+            eval_storage["postprocessed_response_token"].extend(completion_ids)
             eval_storage["score"].append(score)
             if sampling:
                 break
@@ -487,14 +488,12 @@ if __name__ == "__main__":
     model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
         'vwxyzjn/EleutherAI_pythia-1b-deduped__sft__tldr',
         config=model_config,
-        use_flash_attention_2=True,
         revision='sft__44413__1708611267',
         trust_remote_code=True,
     )
     ref_policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
         'vwxyzjn/EleutherAI_pythia-1b-deduped__sft__tldr',
         config=model_config,
-        use_flash_attention_2=True,
         revision='sft__44413__1708611267',
         trust_remote_code=True,
     )
@@ -508,6 +507,8 @@ if __name__ == "__main__":
         optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, eps=args.eps)
+    elif args.optimizer == 'rmsprop':
+        optimizer = optim.RMSprop(model.parameters(), lr=args.lr)
 
     scheduler = get_scheduler(
         args.scheduler,
@@ -553,22 +554,13 @@ if __name__ == "__main__":
     generation_config = GenerationConfig(
         max_new_tokens=args.response_length,
         min_new_tokens=args.response_length,
-        temperature=(args.temperature + 1e-7),
+        temperature=args.temperature,
         top_k=0.0,
         top_p=1.0,
         use_cache=True,
         do_sample=True,
     )
-    # use the same `0.01` temperature for validation response generation https://github.com/openai/summarize-from-feedback/blob/700967448d10004279f138666442bf1497d0e705/exps/sample.py#L27
-    validation_generation_config = GenerationConfig(
-        max_new_tokens=args.response_length,
-        min_new_tokens=args.response_length,
-        temperature=(0.01 + 1e-7),
-        top_k=0.0,
-        top_p=1.0,
-        do_sample=True,
-    )
-
+    
     accelerator.print("===training policy===")
     global_step = 0
     start_time = time.time()
@@ -596,46 +588,43 @@ if __name__ == "__main__":
             global_step += args.micro_batch_size
 
             with torch.no_grad():
-                queries = data["query_token"].to(device)
-                context_length = queries.shape[1]
-                num_examples = queries.shape[0]
+                query = data["query_token"].to(device)
+                context_length = query.shape[1]
+                num_examples = query.shape[0]
                 
-                query = queries
                 query = query.repeat(2, 1)
-                query_responses, logits = generate(
+                output, logits = generate(
                     accelerator.unwrap_model(model),
                     query,
                     tokenizer,
                     generation_config,
                 )
                 
-                responses = query_responses[:, context_length:]
-                postprocessed_responses = truncate_response(args, tokenizer, responses)
-                postprocessed_query_responses = torch.cat((query, postprocessed_responses), 1)
+                del logits
+
+                completion_ids = output[:, context_length:]
+                completion_ids, completion_mask = truncate_response(args, tokenizer, completion_ids)
+                prompt_completion_ids = torch.cat((query, completion_ids), 1)
 
                 with torch.no_grad():
-                    ref_output = forward(ref_policy, postprocessed_query_responses, tokenizer)
+                    ref_output = forward(ref_policy, prompt_completion_ids, tokenizer)
                     ref_logits = ref_output.logits[:, context_length - 1 : -1]
                     ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
-                    ref_logprobs = torch.gather(ref_all_logprob, 2, responses.unsqueeze(-1)).squeeze(-1)
+                    ref_logprobs = torch.gather(ref_all_logprob, 2, completion_ids.unsqueeze(-1)).squeeze(-1)
                 
                     del ref_output, ref_logits, ref_all_logprob
                     torch.cuda.empty_cache()
 
-                    sequence_lengths = first_true_indices(postprocessed_responses == tokenizer.pad_token_id) - 1
-                    _, scores, _ = get_reward(reward_model, postprocessed_query_responses, tokenizer, context_length)
+                    # sequence_lengths = first_true_indices(completion_ids == tokenizer.pad_token_id) - 1
+                    _, scores, _ = get_reward(reward_model, prompt_completion_ids, tokenizer, context_length)
 
                 torch.cuda.empty_cache()
-                contain_eos_token = torch.any(postprocessed_responses == tokenizer.eos_token_id, dim=-1)
+                contain_eos_token = torch.any(completion_ids == tokenizer.eos_token_id, dim=-1)
                 if args.non_eos_penalty:
-                    scores = torch.where(contain_eos_token, scores, torch.full_like(scores, args.penalty_reward_value))
+                    scores[~contain_eos_token] -= args.penalty_reward_value
                 accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
 
-                # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
-                sequence_lengths_p1 = sequence_lengths + 1
-                response_idxs = torch.arange(responses.shape[1], device=responses.device).repeat(responses.shape[0], 1)
-                padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
-                padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
+                padding_mask = ~completion_mask.bool()
                 ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
 
             first_half, second_half = scores.split(num_examples)
@@ -647,10 +636,10 @@ if __name__ == "__main__":
             gradient_accumulation_idx = 0
 
             with accelerator.accumulate(model):
-                output = forward(model, postprocessed_query_responses, tokenizer)
+                output = forward(model, prompt_completion_ids, tokenizer)
                 logits = output.logits[:, context_length - 1 : -1]
                 all_logprobs = F.log_softmax(logits, dim=-1)
-                logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
+                logprobs = torch.gather(all_logprobs, 2, completion_ids.unsqueeze(-1)).squeeze(-1)
                 logprobs = logprobs.masked_fill(padding_mask, 1.0)
 
                 cr_indices = torch.cat((chosen_indices, rejected_indices), dim=0)  # cr = chosen and rejected

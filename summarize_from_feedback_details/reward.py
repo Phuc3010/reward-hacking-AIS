@@ -46,6 +46,7 @@ class Args:
     cuda: bool = True
     """Whether to use cuda if available."""
     run_name: Optional[str] = None
+    eval_every: int = 9216
     """a unique name of this run"""
     load_from_cache_file: bool = False
     """Whether to load data from the local cache file in `dataset.map`"""
@@ -405,28 +406,29 @@ if __name__ == "__main__":
     gradient_accumulation_idx = 0
     global_step = 0
     update = 0
-    if args.run_eval:
-        for eval_split in eval_dataloaders:
-            evaluate_df = evaluate(args, accelerator, tokenizer, model, eval_dataloaders[eval_split])
-            for split, row in evaluate_df[["split", "accuracy"]].groupby(["split"]).mean().iterrows():
-                writer.add_scalar(f"eval/rm/{eval_split}/accuracy/split/{split}", row["accuracy"], global_step)
-                accelerator.print(f"eval/rm/{eval_split}/accuracy/split/{split}: {row['accuracy']}")
-            for batch, row in evaluate_df[["batch", "accuracy"]].groupby(["batch"]).mean().iterrows():
-                writer.add_scalar(f"eval/rm/{eval_split}/accuracy/batch/{batch}", row["accuracy"], global_step)
-                accelerator.print(f"eval/rm/{eval_split}/accuracy/batch/{batch}: {row['accuracy']}")
-            writer.add_scalar(f"eval/rm/{eval_split}/accuracy", evaluate_df["accuracy"].mean(), global_step)
-            accelerator.print(f"eval/rm/{eval_split}/accuracy: {evaluate_df['accuracy'].mean()}")
-            if accelerator.is_main_process:
-                os.makedirs(f"eval_tables/{args.run_name}", exist_ok=True)
-                evaluate_df.to_csv(f"eval_tables/{args.run_name}/eval_{eval_split}_{update}.csv")
-                if args.track:
-                    wandb.log({f"samples/{eval_split}/query_responses": wandb.Table(dataframe=evaluate_df)}, step=update)
-            del evaluate_df
-            torch.cuda.empty_cache()
-        
     for epoch in range(args.num_train_epochs):
         accelerator.print(f"epoch: {epoch}")
         for data in dataloader:
+            if args.run_eval:
+                if global_step % args.eval_every == 0:
+                    for eval_split in eval_dataloaders:
+                        evaluate_df = evaluate(args, accelerator, tokenizer, model, eval_dataloaders[eval_split])
+                        for split, row in evaluate_df[["split", "accuracy"]].groupby(["split"]).mean().iterrows():
+                            writer.add_scalar(f"eval/rm/{eval_split}/accuracy/split/{split}", row["accuracy"], global_step)
+                            accelerator.print(f"eval/rm/{eval_split}/accuracy/split/{split}: {row['accuracy']}")
+                        for batch, row in evaluate_df[["batch", "accuracy"]].groupby(["batch"]).mean().iterrows():
+                            writer.add_scalar(f"eval/rm/{eval_split}/accuracy/batch/{batch}", row["accuracy"], global_step)
+                            accelerator.print(f"eval/rm/{eval_split}/accuracy/batch/{batch}: {row['accuracy']}")
+                        writer.add_scalar(f"eval/rm/{eval_split}/accuracy", evaluate_df["accuracy"].mean(), global_step)
+                        accelerator.print(f"eval/rm/{eval_split}/accuracy: {evaluate_df['accuracy'].mean()}")
+                        if accelerator.is_main_process:
+                            os.makedirs(f"eval_tables/{args.run_name}", exist_ok=True)
+                            evaluate_df.to_csv(f"eval_tables/{args.run_name}/eval_{eval_split}_{update}.csv")
+                            if args.track:
+                                wandb.log({f"samples/{eval_split}/query_responses": wandb.Table(dataframe=evaluate_df)}, step=update)
+                        del evaluate_df
+                        torch.cuda.empty_cache()
+
             update += 1
             global_step += args.micro_batch_size
             query_responses = torch.cat((data["query_chosen_token"], data["query_rejected_token"]), dim=0)
