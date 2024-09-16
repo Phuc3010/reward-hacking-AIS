@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=2,4
+export CUDA_VISIBLE_DEVICES=3,4
 SEED=0
 
 if [ -z "$MODEL" ]; then
@@ -14,13 +14,13 @@ REWARD_MODEL_PATH=models/$MODEL/reward_model_$SEED
 SFT_MODEL_PATH=models/$MODEL/sft_model_$SEED
 
 # vary the following parameters to fit your GPU memory
-gradient_accumulation_steps=8 # bigger fits better on GPU
+gradient_accumulation_steps=4 # bigger fits better on GPU
 local_micro_batch_size=4 # smaller fits better on GPU
 
 
 betas=("0.01" "0.05" "0.1")
 losses=("length_IS" "dpo" "clip")
-epochs=("1" "3")
+epochs=("1" "2")
 
 for epoch in "${epochs[@]}"; do
 for beta in "${betas[@]}"; do
@@ -34,11 +34,11 @@ for loss_name in "${losses[@]}"; do
         --loss_name=$loss_name\
         --optimizer=rmsprop\
         --num_train_epochs=$epoch\
-        --warm_up_steps=$((epoch == 1 ? 150 : 450))\
+        --warm_up_steps=$((epoch == 1 ? 300 : 600))\
         --sft_model_path=$SFT_MODEL_PATH \
         --output_dir=$OFF_POLICY_MODEL_PATH \
         --lr=$LR\
-        --save_steps=$((epoch == 1 ? 9152 : 27456))\
+        --save_steps=$((epoch == 1 ? 9152 : 18304))\
         --beta=$beta\
         --local_micro_batch_size=$local_micro_batch_size\
         --gradient_accumulation_steps=$gradient_accumulation_steps\

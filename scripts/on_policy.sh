@@ -14,7 +14,7 @@ SFT_MODEL_PATH=models/$MODEL/sft_model_44413
 POLICY_MODEL_PATH=models/$MODEL/on_policy_dpo_beta_0.1_$SEED
 
 # vary the following parameters to fit your GPU memory
-gradient_accumulation_steps=8 # bigger fits better on GPU
+gradient_accumulation_steps=4 # bigger fits better on GPU
 local_micro_batch_size=4 # smaller fits better on GPU
 local_eval_batch_size=2 # smaller fits better on GPU
 
@@ -38,15 +38,16 @@ poetry run accelerate launch --config_file deepspeed.yaml \
     --main_process_port=2950 \
     summarize_from_feedback_details/on_policy.py \
     --gradient_accumulation_steps=$gradient_accumulation_steps \
-    --warm_up_steps=450 \
+    --warm_up_steps=600 \
     --local_micro_batch_size=$local_micro_batch_size \
     --response_length=64 \
     --base_model=$MODEL \
-    --num_updates=1450\
+    --num_updates=2900 \
     --optimizer=rmsprop \
-    --num_train_epochs=3\
+    --temperature=1.0 \
+    --num_train_epochs=2\
     --sft_model_path=$SFT_MODEL_PATH \
-    --save_steps=27456 \
+    --save_steps=18304 \
     --reward_model_path=$REWARD_MODEL_PATH \
     --lr=5e-7 \
     --deepspeed \
