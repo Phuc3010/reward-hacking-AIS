@@ -15,6 +15,7 @@ from transformers import (
     AutoConfig,
     AutoModel,
     AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
     AutoTokenizer,
     GenerationConfig,
     PretrainedConfig,
@@ -28,54 +29,6 @@ class RunRecord:
     hf_repo_url: str
     hf_repo_id: str
     revision: str
-
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.normal_(layer.weight, std=std)
-    torch.nn.init.constant_(layer.bias, val=bias_const)
-    return layer
-
-
-class ScalarModelConfig(PretrainedConfig):
-    def __init__(
-        self,
-        base_model: str = "EleutherAI/pythia-160m",
-        base_config: PretrainedConfig = AutoConfig.from_pretrained("EleutherAI/pythia-160m"),
-        hidden_size: int = 768,
-        bias: float = 0.0,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.base_model = base_model
-        self.base_config = base_config
-        self.hidden_size = hidden_size
-        self.bias = bias
-
-
-class ScalarModel(PreTrainedModel):
-    config_class = ScalarModelConfig
-
-    def __init__(self, config: ScalarModelConfig):
-        super().__init__(config)
-        self.config = config
-        self.lm_backbone = AutoModel.from_pretrained(
-            config.base_model,
-            config=self.config.base_config,
-            trust_remote_code=True,
-        )
-        self.scalar_head = layer_init(
-            nn.Linear(self.config.hidden_size, 1),
-            std=1 / np.sqrt(self.config.hidden_size + 1),
-        )
-
-    def forward(self, **kwargs):
-        output = self.lm_backbone(**kwargs)
-        reward = self.scalar_head(output.hidden_states[-1]) - self.config.bias
-        return reward
-    
-
-######
-# Utility functions
-######
 
 def generate(lm_backbone, queries, tokenizer, generation_config):
     """generate in a way that does not affect padding tokens"""
@@ -91,6 +44,10 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
     )
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.normal_(layer.weight, std=std)
+    torch.nn.init.constant_(layer.bias, val=bias_const)
+    return layer
 
 def forward(model, query_responses, labels, tokenizer, gather: bool = True):
     attention_mask = query_responses != tokenizer.pad_token_id
@@ -130,6 +87,43 @@ def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
         table.add_row(*row.astype(str).tolist())
     console.rule(f"[bold red]{title}")
     console.print(table)
+
+class ScalarModelConfig(PretrainedConfig):
+    def __init__(
+        self,
+        base_model: str = "EleutherAI/pythia-160m",
+        base_config: PretrainedConfig = AutoConfig.from_pretrained("EleutherAI/pythia-160m"),
+        hidden_size: int = 768,
+        bias: float = 0.0,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.base_model = base_model
+        self.base_config = base_config
+        self.hidden_size = hidden_size
+        self.bias = bias
+
+
+class ScalarModel(PreTrainedModel):
+    config_class = ScalarModelConfig
+
+    def __init__(self, config: ScalarModelConfig):
+        super().__init__(config)
+        self.config = config
+        self.lm_backbone = AutoModel.from_pretrained(
+            config.base_model,
+            config=self.config.base_config,
+            trust_remote_code=True,
+        )
+        self.scalar_head = layer_init(
+            nn.Linear(self.config.hidden_size, 1),
+            std=1 / np.sqrt(self.config.hidden_size + 1),
+        )
+
+    def forward(self, **kwargs):
+        output = self.lm_backbone(**kwargs)
+        reward = self.scalar_head(output.hidden_states[-1]) - self.config.bias
+        return reward
 
 
 if __name__=="__main__":
@@ -180,7 +174,6 @@ if __name__=="__main__":
     df = df.groupby(["base_model", "exp", "seed"]).agg(lambda x: x.tolist()[0])
     model_seed = 44413
     sft_record = RunRecord(**df.loc[("EleutherAI/pythia-1b-deduped", "sft", model_seed)])
-    rm_record = RunRecord(**df.loc[("EleutherAI/pythia-6.9b-deduped", "reward", model_seed)]) # larger (in some sense gold) RM
 
     ######
     # Start
@@ -207,12 +200,14 @@ if __name__=="__main__":
         revision=sft_record.revision,
         use_cache=True,
         torch_dtype=torch.bfloat16,
+        use_flash_attention_2=True,
         trust_remote_code=True,
     ).to(device)
 
     model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         torch_dtype=torch.bfloat16,
+        use_flash_attention_2=True,
         use_cache=True,
         trust_remote_code=True,
     ).to(device)
@@ -223,31 +218,58 @@ if __name__=="__main__":
     sft_dataset = sft_dataset['validation']
     sft_dataset = sft_dataset.shuffle(args.seed)
     sft_dataset = sft_dataset.select(range(args.n_samples))
+    sft_dataset = sft_dataset.with_format(
+    "torch",
+    columns=[
+        "query_token",
+        'query_reference_response_token',
+        'query_reference_response',
+        'reference_response_token',
+    ]
+    )
+
+    sft_loader = torch.utils.data.DataLoader(
+        sft_dataset, 
+        batch_size=8
+    )
 
     all_model_query_responses = []
     all_reference_query_responses = []
     context_lengths = []
+    i = 0 
 
-    for i in tqdm(range(len(sft_dataset))):
+    for batch in tqdm(sft_loader):
         with torch.no_grad():
-            query = torch.LongTensor(sft_dataset[i : i + 1]["query_token"]).to(device)
-            query_reference_response = torch.cat((query, torch.LongTensor(tokenizer.encode(sft_dataset[i]["reference_response"])).unsqueeze(0).to(device)), dim=1)
+            query = batch['query_token'].to(device)
+            query_reference_response = batch['query_reference_response_token']
+            tokenizer.padding_side = 'left'
+            query_reference_response = tokenizer(batch['query_reference_response'], padding='max_length', max_length=640, truncation=True, return_tensors='pt')['input_ids'].to(device)
+            tokenizer.padding_side = 'right'
             context_length = query.shape[1]
-            table['Prompt'] = tokenizer.decode(query[0], skip_special_tokens=True)
+            table['Prompt'].extend(tokenizer.batch_decode(query, skip_special_tokens=True))
             model_query_response = generate(model, query, tokenizer, validation_generation_config)
 
-            all_model_query_responses.append(model_query_response.cpu())
-            all_reference_query_responses.append(query_reference_response.cpu())
-            context_lengths.append(context_length)
-            model_response = model_query_response[:, context_length:]
-            reference_response = query_reference_response[:, context_length:]
+            model_query_response_lst = model_query_response.cpu().split(1, dim=0)
+            reference_query_response_lst = query_reference_response.cpu().split(1, dim=0)
+            
+            all_model_query_responses.extend(model_query_response_lst)
+            all_reference_query_responses.extend(reference_query_response_lst)
+            context_lengths.extend([context_length] * 8)
 
-            model_logprobs = forward(model, model_query_response, model_query_response, tokenizer, gather=False)
-            reference_model_logprobs = forward(sft_model, model_query_response, model_query_response, tokenizer, gather=False)
+            model_response = model_query_response[:, context_length:]
+
+            labels = model_query_response.clone()
+            labels[:, :context_length] = tokenizer.pad_token_id
+            
+            model_logprobs = forward(model, model_query_response, labels, tokenizer, gather=False)
+            reference_model_logprobs = forward(sft_model, model_query_response, labels, tokenizer, gather=False)
             kl_div = torch.nn.functional.kl_div(input=reference_model_logprobs, target=model_logprobs, log_target=True, reduction='none').sum(dim=(1,2))
-            table[f"{args.key} Model Response"].append(tokenizer.decode(model_response[0], skip_special_tokens=True).strip())
-            table["Reference Model Response"].append(tokenizer.decode(reference_response[0], skip_special_tokens=True).strip())
-            table['KL Divergence'].append(kl_div.item())
+
+            table[f"{args.key} Model Response"].extend(tokenizer.batch_decode(model_response, skip_special_tokens=True))
+            table["Reference Model Response"].extend(tokenizer.batch_decode(batch['reference_response_token'], skip_special_tokens=True))
+            table['KL Divergence'].extend(kl_div.cpu().tolist())
+
+    print(f"KL divergence: {sum(table['KL Divergence']) / len(table['KL Divergence'])}")
 
     model.to('cpu')
     sft_model.to('cpu')
@@ -255,19 +277,25 @@ if __name__=="__main__":
     import gc
     gc.collect()
     torch.cuda.empty_cache()
+    
+    model_seed = 44413
+    # rm_record = RunRecord(**df.loc[("EleutherAI/pythia-6.9b-deduped", "reward", model_seed)]) # larger (in some sense gold) RM
+    hf_repo_id = 'vwxyzjn/EleutherAI_pythia-6.9b-deduped__reward__tldr'
+    revision = 'reward__44413__1708628552'
 
     scalar_model_config = ScalarModelConfig.from_pretrained(
-        rm_record.hf_repo_id,
-        revision=rm_record.revision,
+        hf_repo_id,
+        revision=revision,
         trust_remote_code=True,
     )
 
     original_model = "/".join(scalar_model_config.base_config["_name_or_path"].split("/")[1:3])
     scalar_model_config.base_config["_name_or_path"] = original_model
     scalar_model_config.base_model = original_model
+
     rm: PreTrainedModel = ScalarModel.from_pretrained(
-        rm_record.hf_repo_id,
-        revision=rm_record.revision,
+        hf_repo_id,
+        revision=revision,
         torch_dtype=torch.float16,
         device_map='cuda',
         trust_remote_code=True,
@@ -278,19 +306,19 @@ if __name__=="__main__":
         with torch.no_grad():
             model_query_response = model_query_response.to(device)
             model_reward, model_reward_logits = get_reward(rm, model_query_response, tokenizer)
-            model_reward_logits = model_reward_logits.squeeze(-1)[:, context_length-1:]
-            table["Model Score (RM)"].append(model_reward[0][0].item())
+            model_reward = model_reward.squeeze().item()
+            table["Model Score (RM)"].append(model_reward)
             table["Model Length"].append(model_query_response.shape[1] - context_length)
 
             reference_query_response = reference_query_response.to(device)
             reference_reward, reference_reward_logits = get_reward(rm, reference_query_response, tokenizer)
-            reference_reward_logits = reference_reward_logits.squeeze(-1)[:, context_length-1:]
-            table["Reference Score (RM)"].append(reference_reward[0][0].item())
+            reference_reward = reference_reward.squeeze().item()
+            table["Reference Score (RM)"].append(reference_reward)
             table["Reference Length"].append(reference_query_response.shape[1] - context_length)
 
-            if reference_reward[0][0].item() < model_reward[0][0].item():
+            if reference_reward < model_reward:
                 table['Policy Wins'].append('wins')
-            elif reference_reward[0][0].item() > model_reward[0][0].item():
+            elif reference_reward > model_reward:
                 table['Policy Wins'].append('lose')
             else:
                 table['Policy Wins'].append('tie')
@@ -312,7 +340,7 @@ if __name__=="__main__":
     results = {
         'total': args.n_samples,
         'seed': args.seed,
-        'judge' : rm_record.hf_repo_id,
+        'judge' : 'EleutherAI/pythia-6.9b-golld-rm',
         'candidate': {
             'name': args.key,
             'wins': policy_wins,
@@ -327,7 +355,7 @@ if __name__=="__main__":
             'scores': sum(reference_scores) / len(reference_scores),
         },
     }
-
+    
     import json
     with open('results/results.json', 'a+') as f:
         json.dump(results, f)
