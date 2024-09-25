@@ -21,6 +21,8 @@ from rich.pretty import pprint
 from rich.table import Table
 from torch import optim
 from torch.utils.data import DataLoader
+from utils import *
+from models import *
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import (
@@ -58,7 +60,7 @@ class Args:
     """Whether to run evaluation"""
 
     # optimizer args
-    eps: float = 1e-8
+    eps: float = 1e-5
     """the epsilon value for the optimizer"""
     lr: float = 3e-6
     """the learning rate"""
@@ -130,141 +132,8 @@ def parse_args() -> tuple[Args, Accelerator]:
     args.micro_batch_size = int(args.local_micro_batch_size * args.world_size)
     args.batch_size = int(args.local_batch_size * args.world_size)
     time_tensor = torch.tensor(int(time.time()), device=accelerator.device)
-    time_int = broadcast(time_tensor, 0).item()  # avoid different timestamps across processes
     args.run_name = f"{args.exp_name}_seed_{args.seed}"
-    if args.push_to_hub:
-        if args.hf_repo_id is None: # auto-generate one
-            args.hf_repo_id = f"{args.base_model.replace('/', '_')}__{args.exp_name}__tldr"
-        if args.hf_entity is None:  # find the current user
-            args.hf_entity = api.whoami()["name"]
-        if "/" not in args.hf_repo_id: # prepend the current user
-            args.hf_repo_id = f"{args.hf_entity}/{args.hf_repo_id}"
-        if args.hf_repo_revision is None:  # auto-generate one
-            args.hf_repo_revision = args.run_name
-        args.hf_repo_url = f"https://huggingface.co/{args.hf_repo_id}/tree/{args.hf_repo_revision}"
     return args, accelerator
-
-
-# taken from https://github.com/vwxyzjn/direct-preference-optimization/blob/f8b8c0f49dc92a430bae41585f9d467d3618fe2f/utils.py#L99
-def disable_dropout(model: torch.nn.Module):
-    """Disable dropout in a model."""
-    for module in model.modules():
-        if isinstance(module, torch.nn.Dropout):
-            module.p = 0
-
-
-def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
-    table = Table(show_lines=True)
-    for column in df.columns:
-        table.add_column(column)
-    for _, row in df.iterrows():
-        table.add_row(*row.astype(str).tolist())
-    console.rule(f"[bold red]{title}")
-    console.print(table)
-
-
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.normal_(layer.weight, std=std)
-    torch.nn.init.constant_(layer.bias, val=bias_const)
-    return layer
-
-
-class ScalarModelConfig(PretrainedConfig):
-    def __init__(
-        self,
-        base_model: str = "EleutherAI/pythia-160m",
-        base_config: PretrainedConfig = AutoConfig.from_pretrained("EleutherAI/pythia-160m"),
-        hidden_size: int = 768,
-        bias: float = 0.0,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.base_model = base_model
-        self.base_config = base_config
-        self.hidden_size = hidden_size
-        self.bias = bias
-
-
-class ScalarModel(PreTrainedModel):
-    config_class = ScalarModelConfig
-
-    def __init__(self, config: ScalarModelConfig):
-        super().__init__(config)
-        self.config = config
-        self.lm_backbone = AutoModel.from_pretrained(
-            config.base_model,
-            config=self.config.base_config,
-            trust_remote_code=True,
-        )
-        self.scalar_head = layer_init(
-            nn.Linear(self.config.hidden_size, 1),
-            std=1 / np.sqrt(self.config.hidden_size + 1),
-        )
-
-    def forward(self, **kwargs):
-        output = self.lm_backbone(**kwargs)
-        reward = self.scalar_head(output.hidden_states[-1]) - self.config.bias
-        return reward
-
-
-def first_true_indices(bools, dtype=torch.long):
-    """
-    Takes an N-dimensional bool tensor and returns an (N-1)-dimensional tensor of integers giving
-    the position of the first True in each "row".
-
-    Returns the length of the rows (bools.size(-1)) if no element is True in a given row.
-    """
-    row_len = bools.size(-1)
-    zero_or_index = row_len * (~bools).type(dtype) + torch.arange(row_len, dtype=dtype, device=bools.device)
-    return torch.min(zero_or_index, dim=-1).values
-
-
-def get_reward(model, query_responses, tokenizer, context_length=0):
-    attention_mask = query_responses != tokenizer.pad_token_id
-    # position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
-    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    reward_logits = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        # position_ids=position_ids,
-        return_dict=True,
-        output_hidden_states=True,
-    )
-    sequence_lengths = first_true_indices(query_responses[:, context_length:] == tokenizer.pad_token_id) - 1 + context_length
-    # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
-    return reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1)
-
-def evaluate(args: Args, accelerator, tokenizer, model, dataloader):
-    model.eval()
-    with torch.no_grad():
-        items = defaultdict(list)
-        for data in tqdm(dataloader):
-            query_responses = torch.cat((data["query_chosen_token"], data["query_rejected_token"]), dim=0)
-            with accelerator.accumulate(model):
-                predicted_reward = get_reward(model, query_responses, tokenizer)
-                chosen_rewards = predicted_reward[:data['query_chosen_token'].shape[0]]
-                rejected_rewards = predicted_reward[data['query_chosen_token'].shape[0]:]
-                accuracy = (chosen_rewards > rejected_rewards).float()
-                accuracy = accelerator.gather(accuracy)
-                chosen_rewards = accelerator.gather(chosen_rewards)
-                rejected_rewards = accelerator.gather(rejected_rewards)
-            for k in data:
-                data[k] = gather_object(data[k])
-            for i in range(len(accuracy)):
-                items["query"].append(tokenizer.decode(data["query_token"][i], skip_special_tokens=True))
-                items["chosen"].append(tokenizer.decode(data["chosen_token"][i]))
-                items["rejected"].append(tokenizer.decode(data["rejected_token"][i]))
-                items["batch"].append(data["batch"][i])
-                items["split"].append(data["split"][i])
-                items["choice"].append(data["choice"][i].item())
-                items["policies"].append(data["policies"][i])
-                items["chosen_policy"].append(data["chosen_policy"][i])
-                items["rejected_policy"].append(data["rejected_policy"][i])
-                items["accuracy"].append(accuracy[i].item())
-                items["chosen_rewards"].append(chosen_rewards[i].item())
-                items["rejected_rewards"].append(rejected_rewards[i].item())
-    model.train()
-    return pd.DataFrame(items)
 
 
 # def train(args: Args):
@@ -273,14 +142,7 @@ if __name__ == "__main__":
     local_seed = args.seed + accelerator.process_index * 100003  # Prime
 
     # load dataset
-    dataset = load_dataset(args.label_dataset, split="train")
-    def swap_labels(ex):
-        if ex['chosen_score'] < ex['rejected_score']:
-            ex['chosen_token'], ex['rejected_token'] = ex['rejected_token'], ex['chosen_token']
-            ex['query_chosen_token'], ex['query_rejected_token'] = ex['query_rejected_token'], ex['query_chosen_token']
-        return ex
-    
-    dataset = dataset.map(swap_labels, num_proc=8)
+    dataset = load_dataset('DatPySci/summarize_from_feedback_oai_preprocessing_pythia-6.9b-gold', split="train")
     dataset = dataset.shuffle(seed=local_seed)
     dataset = dataset.select(range(args.total_episodes))
     dataset = dataset.with_format(
@@ -299,9 +161,8 @@ if __name__ == "__main__":
     eval_datasets = []
     eval_dataloaders = {}
     for split in ["test"]:
-        validation_dataset = load_dataset(args.label_dataset, split=split).flatten()
+        validation_dataset = load_dataset('DatPySci/summarize_from_feedback_oai_preprocessing_pythia-6.9b-gold', split="test")
         validation_dataset = validation_dataset.select(range(256))
-        validation_dataset = validation_dataset.map(swap_labels, num_proc=8)
         validation_dataset = validation_dataset.with_format(
             "torch",
             columns=[
@@ -383,6 +244,7 @@ if __name__ == "__main__":
         optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, eps=args.eps)
+    
     scheduler = get_scheduler(
         args.scheduler,
         optimizer=optimizer,

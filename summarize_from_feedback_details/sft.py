@@ -135,7 +135,7 @@ def parse_args() -> tuple[Args, Accelerator]:
     args.batch_size = int(args.local_batch_size * args.world_size)
     time_tensor = torch.tensor(int(time.time()), device=accelerator.device)
     time_int = broadcast(time_tensor, 0).item()  # avoid different timestamps across processes
-    args.run_name = f"{args.exp_name}__{args.seed}__{time_int}"
+    args.run_name = f"{args.exp_name}__{args.seed}"
     if args.push_to_hub:
         if args.hf_repo_id is None: # auto-generate one
             args.hf_repo_id = f"{args.base_model.replace('/', '_')}__{args.exp_name}__tldr"
@@ -289,11 +289,6 @@ if __name__ == "__main__":
     dataset = load_dataset(args.query_dataset, split="train")
     dataset = dataset.with_format("torch", columns=["query_reference_response_token"])
     dataloader = DataLoader(dataset, batch_size=args.local_micro_batch_size, shuffle=True)
-    eval_dataloaders = {}
-    for split in ["validation", "test"]:
-        eval_dataset = load_dataset(args.query_dataset, split=split)
-        eval_dataset = eval_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
-        eval_dataloaders[split] = DataLoader(eval_dataset, batch_size=args.local_eval_batch_size)
     args.total_episodes = len(dataset)
     args.num_updates = args.total_episodes // args.batch_size
 
@@ -348,6 +343,7 @@ if __name__ == "__main__":
         optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, eps=args.eps)
+
     scheduler = get_scheduler(
         args.scheduler,
         optimizer=optimizer,
@@ -359,7 +355,6 @@ if __name__ == "__main__":
     # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
     torch.manual_seed(args.seed)
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
-    eval_dataloaders = {split: accelerator.prepare(eval_dataloader) for split, eval_dataloader in eval_dataloaders.items()}
     torch.manual_seed(local_seed)  # reset the local seed again
 
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
@@ -407,30 +402,11 @@ if __name__ == "__main__":
                 writer.add_scalar("train/sft/loss", accelerator.gather(loss_stats).mean().item(), update)
                 writer.add_scalar("train/sft/lr", scheduler.get_last_lr()[0], update)
                 accelerator.print(f"{loss.item()=}, {scheduler.get_last_lr()=}, {optimizer.param_groups[0]['lr']=}, {update=}")
-
-    if args.run_eval:
-        for eval_split in eval_dataloaders:
-            eval_df, rouge_scores, all_eval_losses = evaluate(
-                args, accelerator, tokenizer, model, eval_dataloaders[eval_split], generation_config
-            )
-            if accelerator.is_main_process:
-                eval_df.to_csv(f"runs/{args.run_name}/{eval_split}_table.csv")
-                if args.track:
-                    wandb.log({f"eval/{eval_split}_query_responses": wandb.Table(dataframe=eval_df)}, step=update)
-            for k, v in rouge_scores.items():
-                rouge_metric = torch.tensor(v, device=device)
-                rouge_metric = accelerator.gather(rouge_metric)
-                writer.add_scalar(f"{eval_split}/sft/rouge/{k}", rouge_metric.mean().item(), update)
-                accelerator.print(f"{eval_split}/sft/rouge/{k}: {rouge_metric.mean().item()} {rouge_metric.shape} {rouge_metric}")
-            writer.add_scalar(f"{eval_split}/sft/loss", torch.stack(all_eval_losses).mean().item(), update)
-
     # save model
     if args.output_dir and args.num_train_epochs > 0:
         os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
         if accelerator.is_main_process:
             tokenizer.save_pretrained(args.output_dir)
-            if args.push_to_hub:
-                tokenizer.push_to_hub(repo_id=args.hf_repo_id, revision=args.hf_repo_revision)
         unwrapped: PreTrainedModel = accelerator.unwrap_model(model)
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
@@ -441,6 +417,3 @@ if __name__ == "__main__":
                 state_dict=accelerator.get_state_dict(model),
                 safe_serialization=False,
             )
-            if args.push_to_hub:
-                unwrapped.push_to_hub(repo_id=args.hf_repo_id, revision=args.hf_repo_revision, safe_serialization=False)
-                accelerator.print(f"🔥 pushed to {args.hf_repo_url}")
