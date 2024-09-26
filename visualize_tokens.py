@@ -132,6 +132,7 @@ if __name__=="__main__":
     parser.add_argument("--model_name_or_path", type=str, required=True)
     parser.add_argument("--key", type=str, required=True)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--model_step", type=int, default=0)
     parser.add_argument("--n_samples", type=int, default=256)
 
     args = parser.parse_args()
@@ -196,8 +197,9 @@ if __name__=="__main__":
 
     console.print("loading", sft_record)
     sft_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-        sft_record.hf_repo_id,
-        revision=sft_record.revision,
+        # sft_record.hf_repo_id,
+        f'models/EleutherAI/pythia-1b-deduped/dpo_policy_beta_0.05_44413/step_{args.model_step}',
+        # revision=sft_record.revision,
         use_cache=True,
         torch_dtype=torch.bfloat16,
         use_flash_attention_2=True,
