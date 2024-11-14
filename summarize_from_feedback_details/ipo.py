@@ -164,7 +164,7 @@ def disable_dropout(model: torch.nn.Module):
         if isinstance(module, torch.nn.Dropout):
             module.p = 0
 
-def forward(model, query_responses, labels, tokenizer):
+def orward(model, query_responses, labels, tokenizer, sum_logps: bool = True):
     attention_mask = query_responses != tokenizer.pad_token_id
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
     output = model(
@@ -176,8 +176,13 @@ def forward(model, query_responses, labels, tokenizer):
     logits = output.logits[:, :-1, :]
     loss_mask = (labels != tokenizer.pad_token_id)
     per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
-    all_logps = (per_token_logps * loss_mask).sum(-1)
+    if sum_logps:
+        all_logps = (per_token_logps * loss_mask).sum(-1)
+    else:
+        all_logps = (per_token_logps * loss_mask)
+
     all_loss_mask = loss_mask.sum(-1)
+
     chosen_logps = all_logps[:query_responses.shape[0] // 2]
     rejected_logps = all_logps[query_responses.shape[0] // 2:]
 
@@ -412,17 +417,17 @@ if __name__ == "__main__":
     torch.manual_seed(local_seed)
     torch.backends.cudnn.deterministic = True
 
-    model_config = AutoConfig.from_pretrained('vwxyzjn/EleutherAI_pythia-2.8b-deduped__sft__tldr', use_cache=False)
+    model_config = AutoConfig.from_pretrained('vwxyzjn/EleutherAI_pythia-1b-deduped__sft__tldr')
     
     model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-        'vwxyzjn/EleutherAI_pythia-2.8b-deduped__sft__tldr',
+        'vwxyzjn/EleutherAI_pythia-1b-deduped__sft__tldr',
         config=model_config,
         revision='sft__44413__1708611267',
         trust_remote_code=True,
     )
     
     ref_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-        'vwxyzjn/EleutherAI_pythia-2.8b-deduped__sft__tldr',
+        'vwxyzjn/EleutherAI_pythia-1b-deduped__sft__tldr',
         config=model_config,
         revision='sft__44413__1708611267',
         trust_remote_code=True,
@@ -450,32 +455,28 @@ if __name__ == "__main__":
     # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
     # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
     torch.manual_seed(args.seed)
-    
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     eval_dataloaders = {split: accelerator.prepare(eval_dataloader) for split, eval_dataloader in eval_dataloaders.items()}
     sft_validation_dataloader = accelerator.prepare(sft_validation_dataloader)
     torch.manual_seed(local_seed)  # reset the local seed again
 
-    # model.gradient_checkpointing_enable()
-    # ref_model.gradient_checkpointing_enable(
+    if args.deepspeed:
+        import deepspeed
+        deepspeed_states = AcceleratorState().deepspeed_plugin
+        deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.local_micro_batch_size
 
-    # if args.deepspeed:
-    #     import deepspeed
-    #     deepspeed_states = AcceleratorState().deepspeed_plugin
-    #     deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.local_micro_batch_size
-
-    #     eval_ds_config = {
-    #         "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
-    #         "bf16": {"enabled": True},
-    #         "prescale_gradients": False,
-    #         "wall_clock_breakdown": False,
-    #     }
-    #     accelerator.print(f"{eval_ds_config=}")
-    #     ref_model, *_ = deepspeed.initialize(model=ref_model, config=eval_ds_config)
-    #     ref_model.eval()
-    # else:
-    ref_model = ref_model.to(device)
-    # ref_model.eval()
+        eval_ds_config = {
+            "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
+            "bf16": {"enabled": True},
+            "prescale_gradients": False,
+            "wall_clock_breakdown": False,
+        }
+        accelerator.print(f"{eval_ds_config=}")
+        ref_model, *_ = deepspeed.initialize(model=ref_model, config=eval_ds_config)
+        ref_model.eval()
+    else:
+        ref_model = ref_model.to(device)
+        ref_model.eval()
     
     # use the same `0.01` temperature for validation response generation https://github.com/openai/summarize-from-feedback/blob/700967448d10004279f138666442bf1497d0e705/exps/sample.py#L27
     validation_generation_config = GenerationConfig(
@@ -510,6 +511,28 @@ if __name__ == "__main__":
                         state_dict=accelerator.get_state_dict(model),
                         safe_serialization=False,
                     )
+                # table = defaultdict(list)
+                # key = f"{args.loss_name}_beta_{args.beta}_lr_{args.lr}_step_{global_step}"
+                # unwrapped: PreTrainedModel = accelerator.unwrap_model(model)
+                # for batch in tqdm(sft_validation_dataloader, total=512):
+                #     queries = batch['query_token']
+                #     reference_responses = batch['reference_response_token']
+                #     context_length = queries.shape[1]
+                #     for i in range(0, queries.shape[0], 1):
+                #         query = queries[i : i+1]
+                #         query_response, logits = generate(
+                #             accelerator.unwrap_model(model).policy,
+                #             query,
+                #             tokenizer,
+                #             validation_generation_config,
+                #         )
+                #         model_response = query_response[:, context_length:]
+                #         table['prompt'].append(tokenizer.decode(query, skip_special_tokens=True))
+                #         table[f"{key} response"].append(tokenizer.decode(model_response[0], skip_special_tokens=True))
+                #         table["reference response"].append(tokenizer.decode(reference_responses[i: i+1], skip_special_tokens=True))
+                # df = pd.DataFrame(table)
+                # df.to_csv(f"results/{key}_table_results.csv", index=False)
+                # print_rich_table("Results", df.head(5), console)
 
             update += 1
             global_step += args.micro_batch_size
@@ -519,20 +542,17 @@ if __name__ == "__main__":
                 ref_chosen_logps, ref_rejected_logps, ref_chosen_mask, ref_rejected_mask = forward(ref_model, query_responses, labels, tokenizer)
             with accelerator.accumulate(model):
                 chosen_logps, rejected_logps, chosen_mask, rejected_mask = forward(model, query_responses, labels, tokenizer)
-                if args.loss_name != 'ipo':
-                    with torch.no_grad():
-                        if args.loss_name == 'length_IS':
-                            ratio = torch.exp((chosen_logps - ref_chosen_logps) / chosen_mask + (rejected_logps - ref_rejected_logps) / rejected_mask)
+                with torch.no_grad():
+                    ratio = torch.exp((chosen_logps - ref_chosen_logps) / chosen_mask + (rejected_logps - ref_rejected_logps) / rejected_mask)
+                
                 pi_logratios = chosen_logps - rejected_logps
                 ref_logratios = ref_chosen_logps - ref_rejected_logps
                 logits = pi_logratios - ref_logratios
-                
-                if args.loss_name == 'ipo':
-                    # mb_losses = -F.logsigmoid(args.beta * logits)
-                    mb_losses = (logits - 1/(2 * args.beta)) ** 2
+
+                if args.loss_name == 'length_IS':
+                    mb_losses = ratio * (logits - 1/(2 * args.beta)) ** 2  # Eq. 17 of https://arxiv.org/pdf/2310.12036v2.pdf
                 else:
-                    mb_losses = ratio * (logits - 1/(2 * args.beta)) ** 2
-                    # mb_losses = -ratio * F.logsigmoid(args.beta * logits)
+                    mb_losses = (logits - 1/(2 * args.beta)) ** 2  # Eq. 17 of https://arxiv.org/pdf/2310.12036v2.pdf
                 
                 loss = mb_losses.mean()
                 accelerator.backward(loss)
@@ -553,7 +573,7 @@ if __name__ == "__main__":
                 scheduler.step()
 
                 train_accuracy = accelerator.gather(accuracies).mean().item()
-                if args.loss_name != 'ipo':
+                if args.loss_name == 'length_IS':
                     train_ratio = accelerator.gather(ratio).mean().item()
                     writer.add_scalar("train/rm/ratio", train_ratio, global_step)
 

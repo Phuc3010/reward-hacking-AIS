@@ -135,6 +135,37 @@ def parse_args() -> tuple[Args, Accelerator]:
     args.run_name = f"{args.exp_name}_seed_{args.seed}"
     return args, accelerator
 
+def evaluate(args: Args, accelerator, tokenizer, model, dataloader):
+    model.eval()
+    with torch.no_grad():
+        items = defaultdict(list)
+        for data in tqdm(dataloader):
+            query_responses = torch.cat((data["query_chosen_token"], data["query_rejected_token"]), dim=0)
+            with accelerator.accumulate(model):
+                predicted_reward = get_reward(model, query_responses, tokenizer)
+                chosen_rewards = predicted_reward[:data['query_chosen_token'].shape[0]]
+                rejected_rewards = predicted_reward[data['query_chosen_token'].shape[0]:]
+                accuracy = (chosen_rewards > rejected_rewards).float()
+                accuracy = accelerator.gather(accuracy)
+                chosen_rewards = accelerator.gather(chosen_rewards)
+                rejected_rewards = accelerator.gather(rejected_rewards)
+            for k in data:
+                data[k] = gather_object(data[k])
+            for i in range(len(accuracy)):
+                items["query"].append(tokenizer.decode(data["query_token"][i], skip_special_tokens=True))
+                items["chosen"].append(tokenizer.decode(data["chosen_token"][i]))
+                items["rejected"].append(tokenizer.decode(data["rejected_token"][i]))
+                items["batch"].append(data["batch"][i])
+                items["split"].append(data["split"][i])
+                items["choice"].append(data["choice"][i].item())
+                items["policies"].append(data["policies"][i])
+                items["chosen_policy"].append(data["chosen_policy"][i])
+                items["rejected_policy"].append(data["rejected_policy"][i])
+                items["accuracy"].append(accuracy[i].item())
+                items["chosen_rewards"].append(chosen_rewards[i].item())
+                items["rejected_rewards"].append(rejected_rewards[i].item())
+    model.train()
+    return pd.DataFrame(items)
 
 # def train(args: Args):
 if __name__ == "__main__":
@@ -228,6 +259,8 @@ if __name__ == "__main__":
         base_model='vwxyzjn/EleutherAI_pythia-1b-deduped__sft__tldr',
         base_config=model_config,
         hidden_size=model_config.hidden_size,
+        use_cache=False,
+        revision='sft__44413__1708611267',
     )
 
     if len(args.reward_model_path) == 0:
@@ -238,6 +271,9 @@ if __name__ == "__main__":
             trust_remote_code=True,
         )
     disable_dropout(model)
+    # model.gradient_checkpointing_enable()
+    model.config.use_cache = False
+
     if accelerator.is_main_process:
         pprint(model_config)
     if args.optimizer == "adam":
@@ -350,8 +386,8 @@ if __name__ == "__main__":
 
         if accelerator.is_main_process:
             tokenizer.save_pretrained(args.output_dir)
-            if args.push_to_hub:
-                tokenizer.push_to_hub(repo_id=args.hf_repo_id, revision=args.hf_repo_revision)
+            # if args.push_to_hub:
+            #     tokenizer.push_to_hub(repo_id=args.hf_repo_id, revision=args.hf_repo_revision)
         unwrapped: PreTrainedModel = accelerator.unwrap_model(model)
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
@@ -362,6 +398,6 @@ if __name__ == "__main__":
                 state_dict=accelerator.get_state_dict(model),
                 safe_serialization=False,
             )
-            if args.push_to_hub:
-                unwrapped.push_to_hub(repo_id=args.hf_repo_id, revision=args.hf_repo_revision, safe_serialization=False)
-                accelerator.print(f"🔥 pushed to {args.hf_repo_url}")
+            # if args.push_to_hub:
+            #     unwrapped.push_to_hub(repo_id=args.hf_repo_id, revision=args.hf_repo_revision, safe_serialization=False)
+            #     accelerator.print(f"🔥 pushed to {args.hf_repo_url}")

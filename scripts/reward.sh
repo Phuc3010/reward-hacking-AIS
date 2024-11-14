@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=5,6
+export CUDA_VISIBLE_DEVICES=0
 SEED=44413
 if [ -z "$MODEL" ]; then
     # MODEL=EleutherAI/pythia-6.9b-deduped
@@ -22,7 +22,7 @@ poetry run accelerate launch --config_file deepspeed.yaml \
     summarize_from_feedback_details/reward.py \
     --base_model=$MODEL \
     --sft_model_path=$SFT_MODEL_PATH \
-    --local_micro_batch_size=4\
+    --local_micro_batch_size=$local_micro_batch_size\
     --gradient_accumulation_steps=8\
     --lr=$LR \
     --deepspeed \

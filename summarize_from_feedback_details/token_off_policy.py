@@ -320,6 +320,8 @@ def evaluate_policy(args: Args, model, tokenizer, dataloader, generation_config,
 # def train(args: Args):
 if __name__ == "__main__":
     args, accelerator = parse_args()
+    args.num_updates = args.total_episodes // args.batch_size
+    accelerator.print(args.num_updates)
     local_seed = args.seed + accelerator.process_index * 100003  # Prime
     
     # load dataset
@@ -372,7 +374,6 @@ if __name__ == "__main__":
     sft_validation_dataset = sft_validation_dataset.select(range(256))
     sft_validation_dataset = sft_validation_dataset.with_format("torch", columns=["query_token", "reference_response_token", "query_reference_response_token_response_label"])
     sft_validation_dataloader = DataLoader(sft_validation_dataset, batch_size=args.local_eval_batch_size)
-    args.num_updates = args.total_episodes // args.batch_size
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model,

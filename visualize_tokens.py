@@ -175,7 +175,7 @@ if __name__=="__main__":
     df = df.groupby(["base_model", "exp", "seed"]).agg(lambda x: x.tolist()[0])
     model_seed = 44413
     sft_record = RunRecord(**df.loc[("EleutherAI/pythia-1b-deduped", "sft", model_seed)])
-
+    
     ######
     # Start
     ######
@@ -196,20 +196,18 @@ if __name__=="__main__":
     sft_dataset = load_dataset("vwxyzjn/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_1706381144")
 
     console.print("loading", sft_record)
+    
     sft_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-        # sft_record.hf_repo_id,
-        f'models/EleutherAI/pythia-1b-deduped/dpo_policy_beta_0.05_44413/step_{args.model_step}',
-        # revision=sft_record.revision,
+        sft_record.hf_repo_id,
+        revision=sft_record.revision,
         use_cache=True,
         torch_dtype=torch.bfloat16,
-        use_flash_attention_2=True,
         trust_remote_code=True,
     ).to(device)
 
     model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         torch_dtype=torch.bfloat16,
-        use_flash_attention_2=True,
         use_cache=True,
         trust_remote_code=True,
     ).to(device)
@@ -243,10 +241,7 @@ if __name__=="__main__":
     for batch in tqdm(sft_loader):
         with torch.no_grad():
             query = batch['query_token'].to(device)
-            query_reference_response = batch['query_reference_response_token']
-            tokenizer.padding_side = 'left'
-            query_reference_response = tokenizer(batch['query_reference_response'], padding='max_length', max_length=640, truncation=True, return_tensors='pt')['input_ids'].to(device)
-            tokenizer.padding_side = 'right'
+            query_reference_response = batch['query_reference_response_token'].to(device)
             context_length = query.shape[1]
             table['Prompt'].extend(tokenizer.batch_decode(query, skip_special_tokens=True))
             model_query_response = generate(model, query, tokenizer, validation_generation_config)
@@ -266,12 +261,22 @@ if __name__=="__main__":
             model_logprobs = forward(model, model_query_response, labels, tokenizer, gather=False)
             reference_model_logprobs = forward(sft_model, model_query_response, labels, tokenizer, gather=False)
             kl_div = torch.nn.functional.kl_div(input=reference_model_logprobs, target=model_logprobs, log_target=True, reduction='none').sum(dim=(1,2))
+            
 
+            labels = query_reference_response.clone()
+            labels[:, :context_length] = tokenizer.pad_token_id
+
+            model_logprobs = forward(model, query_reference_response, labels, tokenizer, gather=False)
+            reference_model_logprobs = forward(sft_model, query_reference_response, labels, tokenizer, gather=False)
+            mu_square_losses = 0.5 * (reference_model_logprobs.exp() * (reference_model_logprobs - model_logprobs)**2).sum(dim=(1,2))
+            
             table[f"{args.key} Model Response"].extend(tokenizer.batch_decode(model_response, skip_special_tokens=True))
             table["Reference Model Response"].extend(tokenizer.batch_decode(batch['reference_response_token'], skip_special_tokens=True))
             table['KL Divergence'].extend(kl_div.cpu().tolist())
+            table['mu loss'].extend(mu_square_losses.cpu().tolist())
 
     print(f"KL divergence: {sum(table['KL Divergence']) / len(table['KL Divergence'])}")
+    print(r"$\mu$ square divergence: {}".format(sum(table['mu loss']) / len(table['mu loss'])))
 
     model.to('cpu')
     sft_model.to('cpu')
@@ -330,6 +335,7 @@ if __name__=="__main__":
     print_rich_table("Results", df.head(15), console)
 
     kl_div = table['KL Divergence']
+    mu_loss = table['mu loss']
     win_rate = table['Policy Wins']
     policy_wins = sum([1 for ele in win_rate if ele == 'wins'])
     reference_wins = sum([1 for ele in win_rate if ele == 'lose'])
@@ -348,6 +354,7 @@ if __name__=="__main__":
             'wins': policy_wins,
             'lengths': sum(policy_lengths) / len(policy_lengths),
             'scores': sum(policy_scores) / len(policy_scores),
+            'mu_loss': sum(mu_loss) / len(mu_loss),
             'KL divergence': sum(kl_div) / len(kl_div)
         },
         'baseline': {
@@ -362,7 +369,3 @@ if __name__=="__main__":
     with open('results/results.json', 'a+') as f:
         json.dump(results, f)
         f.write('\n')
-
-
-
-    

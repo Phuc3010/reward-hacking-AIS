@@ -106,7 +106,7 @@ class Args:
     """the mini batch size across GPUs"""
     local_eval_batch_size: int = 2
     """per rank eval batch size"""
-    local_rollout_forward_batch_size: int = 64
+    local_rollout_forward_batch_size: int = 32
     """per rank no grad forward pass in the rollout phase"""
     missing_eos_penalty: float = 1.0
     save_steps: int = 3600
@@ -429,7 +429,7 @@ if __name__ == "__main__":
     # load dataset
     dataset = load_dataset(args.query_dataset, split="train")
     dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
-    args.total_episodes = 3 * len(dataset)
+    args.total_episodes = 2 * len(dataset)
     args.num_updates = args.total_episodes // args.batch_size
     dataloader = DataLoader(dataset, batch_size=args.local_batch_size, shuffle=True)
     eval_dataloaders = {}
@@ -517,12 +517,13 @@ if __name__ == "__main__":
     elif args.optimizer == "adamw":
         optimizer = optim.AdamW(policy.parameters(), lr=args.lr, eps=args.eps)
 
-    scheduler = get_scheduler(
-        args.scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=args.warm_up_steps,
-        num_training_steps=args.num_updates,
-    )
+    # scheduler = get_scheduler(
+    #     args.scheduler,
+    #     optimizer=optimizer,
+    #     num_warmup_steps=args.warm_up_steps,
+    #     num_training_steps=args.num_updates,
+    # )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: min(1.0, (step + 1) / (args.warm_up_steps + 1)))
 
     # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
     # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
@@ -604,29 +605,9 @@ if __name__ == "__main__":
                     state_dict=accelerator.get_state_dict(policy),
                     safe_serialization=False,
                 )
-        global_step += 1 * args.batch_size
-        # frac = 1.0 - (update - 1.0) / args.num_updates
-        # lrnow = frac * args.lr
-        # optimizer.param_groups[0]["lr"] = lrnow
+        global_step += args.batch_size
         data = next(iter_dataloader)
         with torch.no_grad():
-        #     eval_storage, eval_df = evaluate(
-        #         reward_model,
-        #         accelerator.unwrap_model(policy),
-        #         tokenizer,
-        #         eval_dataloaders[eval_split],
-        #         validation_generation_config,
-        #     )
-        #     validation_score = eval_storage["score"][0]
-        #     if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
-        #         if accelerator.is_main_process:
-        #             eval_ds = Dataset.from_pandas(eval_df)
-        #             eval_ds.save_to_disk(f"runs/{args.run_name}/{eval_split}_dataset_{global_step}")
-        #             if args.track:
-        #                 wandb.log({f"samples/{eval_split}_query_responses": wandb.Table(dataframe=eval_df)}, step=update)
-        #     del eval_storage, eval_df
-        #     torch.cuda.empty_cache()
-
             queries = data["query_token"].to(device)
             queries = queries.repeat(args.rloo_k, 1)
             context_length = queries.shape[1]
@@ -695,7 +676,7 @@ if __name__ == "__main__":
             if args.non_eos_penalty:
                 scores[~contain_eos_token] -= args.missing_eos_penalty
             
-            accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
+            # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
 
             # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
             response_idxs = torch.arange(responses.shape[1], device=responses.device).repeat(responses.shape[0], 1)
@@ -743,8 +724,6 @@ if __name__ == "__main__":
                         logprobs_diff = new_logprobs - mb_logprobs
                         ratio = torch.exp(logprobs_diff)
                         pg_losses = -mb_advantage * ratio
-                        # pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.ppo.cliprange, 1.0 + args.ppo.cliprange)
-                        # pg_loss_max = torch.max(pg_losses, pg_losses2)
                         pg_loss = pg_losses.mean()
                         loss = pg_loss
                         accelerator.backward(loss)
@@ -752,7 +731,6 @@ if __name__ == "__main__":
                         optimizer.zero_grad()
                         
                         with torch.no_grad():
-                            # pg_clipfrac = (pg_losses2 > pg_losses).float().mean()
                             prob_dist = torch.nn.functional.softmax(logits, dim=-1)
                             entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
                             approxkl = 0.5 * (logprobs_diff**2).mean()
@@ -815,8 +793,10 @@ if __name__ == "__main__":
                 "scores": accelerator.gather(scores).mean().item(),
                 "non_score_reward": accelerator.gather(mean_non_score_reward).mean().item(),
                 "rlhf_reward": accelerator.gather(rlhf_reward).mean().item(),
-                "num_eos_tokens": (responses == tokenizer.eos_token_id).sum().item()
+                "num_eos_tokens": (responses == tokenizer.eos_token_id).sum().item(),
+                'lr': scheduler.get_last_lr()[0]
             }
+            
             metrics = formatted_dict(metrics)
             accelerator.print(f'train stats after {global_step} examples: {metrics}')
         del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
